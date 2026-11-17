@@ -1,0 +1,12 @@
+{
+  "provenance": {
+    "capturedAt": 1793512204676,
+    "requestId": "7825a3d8-8834-4f95-a1c9-681fca3f552c",
+    "source": "daily dsh-connect-router logs, existing 429; no request induced"
+  },
+  "failure": {
+    "code": "ZCODE_NATIVE_QUOTA_REJECTED",
+    "status": 429,
+    "message": "ZCODE_NATIVE_QUOTA_REJECTED"
+  }
+}

@@ -1,0 +1,10 @@
+# Host 任务队列与原生 Wiki 面板。以下为尚未配置项目的初始值。
+- insert:
+    - id: dsh-repowiki
+      name: dsh-repowiki
+      config:
+        language: 'zh'
+        # 插件级排除规则（.gitignore 语法，最多 200 条）。项目设置里的排除规则叠加在其后。
+        # exclude:
+        #   - 'dist/'
+        #   - 'vendor/**'

@@ -1,0 +1,117 @@
+{
+  "name": "dsh-repowiki",
+  "displayName": {
+    "zh": "DSH 仓库维基",
+    "en": "DSH RepoWiki"
+  },
+  "description": {
+    "zh": "对本地代码仓库生成 DeepWiki 式多页维基：扫描结构、规划页面、逐页用 DSH 已配置模型撰写 Markdown，并在 DSH 原生面板中阅读。",
+    "en": "Generates a DeepWiki-style multi-page wiki for a local repository and reads it in a native DSH panel."
+  },
+  "version": "0.7.11",
+  "private": true,
+  "author": "dsh-link",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "wiki",
+    "repowiki",
+    "documentation"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./typert": "./lib/typert.host.js",
+    "./remote": "./lib/typert.remote-client.js",
+    "./types": "./lib/shared/types.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5 || ~4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "@deepseek-ai/dsh-workspace": "0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-rc.1 || >=0.2.2-rc.3 <0.2.3-0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-agent": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-api-remotes": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-layout": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-sidebar": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-sandbox-policy": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-generator": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-typert-registry": "0.2.2-rc.3",
+    "@deepseek-ai/dsh-workspace": "0.2.2-rc.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.1",
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.25.0",
+    "mermaid": "12.2.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "zod": "4.6.6"
+  },
+  "overrides": {
+    "zod": "$zod"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "test": "tsx --test test/*.test.ts",
+    "check:package": "node scripts/verify-package.mjs",
+    "check": "npm run build && npm run typecheck && npm test",
+    "prepack": "npm run check && npm run check:package"
+  },
+  "dependencies": {
+    "ignore": "7.0.14",
+    "typescript": "^5.8.0"
+  }
+}
