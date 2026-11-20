@@ -82,3 +82,24 @@ test('可读性上限：正文超过 8,000 字符时提示精简', () => {
   assert.ok(result.chars > 8000)
   assert.match(result.soft.join('；'), /正文 \d+ 字符超过 8000/)
 })
+
+test('可读性上限：用户页代码符号过密触发软警告，引用提示不再要求抄到页尾', () => {
+  const jargon = '调用 `enhanceDraft` 后经 `validateRequest` 校验 `protectedTokens` 与 `settingsRevision`，再由 `BlockAssembler` 汇总 `AbortSignal` 并抛出 `EnhanceError`。'.repeat(3)
+  const doc = ['# 使用指南', '', '快速上手。', '', '## 第一节', '', jargon, '', '## 第二节', '', jargon, '', '`src/a.ts:L1` '.repeat(15)].join('\n')
+  const result = evaluatePage(page('workflow'), doc, sources('src/a.ts', 'src/b.ts'), ['src/a.ts', 'src/b.ts'], { userRoute: true })
+  const soft = result.soft.join('；')
+  assert.match(soft, /正文代码符号偏密/)
+  assert.match(soft, /行内引用 \d+ 处偏多/)
+  assert.doesNotMatch(soft, /收进页尾/)
+})
+
+test('分类导览页（isHub）允许精炼篇幅（400-3000 字符）且只需 1 个来源与 1 个二级标题', () => {
+  const hub = { id: 'user-guide', kind: 'page' as const, isHub: true, type: 'guide' as const, parentId: null, title: '使用指南', summary: '使用指南总览', relatedPaths: ['README.md'] }
+  const doc = ['# 使用指南', '', '本分类覆盖安装、日常操作、设置与排错。', '', '## 子页导航', '', '各功能操作请按需阅读对应子页。'.repeat(25), '', '`README.md:L1`'].join('\n')
+  const result = evaluatePage(hub, doc, sources('README.md'), ['README.md'])
+  assert.deepEqual(result.hard, [])
+  assert.doesNotMatch(result.soft.join('；'), /超过 3000/)
+  const bloated = ['# 使用指南', '', '导语。', '', '## 子页导航', '', '内容说明。'.repeat(900), '', '`README.md:L1`'].join('\n')
+  const bloatedResult = evaluatePage(hub, bloated, sources('README.md'), ['README.md'])
+  assert.match(bloatedResult.soft.join('；'), /超过 3000（导览页应精炼/)
+})

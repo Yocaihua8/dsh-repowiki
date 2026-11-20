@@ -93,3 +93,28 @@ test('质量门禁复用共享判定，并逐块报告无效 Mermaid', () => {
   assert.doesNotMatch(result.soft.join('；'), /Mermaid 关系图不足/)
   assert.match(result.soft.join('；'), /缺少有效图类型/)
 })
+
+test('包含有效 Mermaid 图的 details 折叠块保持整体切分', () => {
+  const md = [
+    '# 模块说明',
+    '',
+    '正文段落。',
+    '',
+    '<details>',
+    '<summary>代码结构参考（自动解析）</summary>',
+    '',
+    '> 自动解析。',
+    '',
+    fence('flowchart TD\n  A --> B'),
+    '',
+    '</details>',
+  ].join('\n')
+  const segments = splitMermaidDiagrams(md)
+  assert.equal(segments.length, 2)
+  assert.equal(segments[0]!.kind, 'markdown')
+  assert.equal(segments[1]!.kind, 'details')
+  if (segments[1]!.kind === 'details') {
+    assert.equal(segments[1]!.summary, '代码结构参考（自动解析）')
+    assert.equal(segments[1]!.segments.some(child => child.kind === 'mermaid'), true)
+  }
+})

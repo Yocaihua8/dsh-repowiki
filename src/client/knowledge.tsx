@@ -15,7 +15,6 @@ export function Knowledge({ wiki, draft, u, onSource }: { wiki: WikiManifest; dr
   const card = cards.find(c => c.id === selected)
   return <section className="drw-knowledge">
     <h1>{u('知识卡片', 'Knowledge cards')} <small className="drw-muted">{wiki.cards?.length ?? 0}</small></h1>
-    <p className="drw-muted">{draft ? u('草稿卡片可预览，发布后才能用于自动引用。', 'Draft cards are previewable. Only published cards can be referenced.') : u('与 Wiki 共享源码快照。未核实的卡片不会自动引用。', 'Shares the Wiki source snapshot. Uncertain cards are excluded from automatic references.')}</p>
     <Input type="search" aria-label={u('搜索知识卡片', 'Search cards')} placeholder={u('搜索标题、摘要和内容', 'Search cards')} value={query} onChange={e => setQuery(e.target.value)} />
     <div className="drw-scroll-tabs"><SegmentedControl id="drw-card-categories" value={category} onChange={setCategory} label={u('卡片分类', 'Card categories')} options={[{ value: 'all', label: u('全部', 'All') }, ...categories.map((value, i) => ({ value, label: names[i]! }))]} /></div>
     {!cards.length && <p className="drw-muted">{u('尚无匹配卡片。', 'No matching cards yet.')}</p>}

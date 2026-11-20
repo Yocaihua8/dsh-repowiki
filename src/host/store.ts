@@ -42,6 +42,7 @@ export interface WritePageInput {
   relatedPageIds?: string[]
 
   kind?: 'group' | 'page'
+  isHub?: boolean
   type?: WikiPageType
   parentId?: string | null
   sources?: SourceExcerpt[]
@@ -77,7 +78,7 @@ export async function writeWiki(stateDir: string, manifest: Omit<WikiManifest, '
       assertSafeId(source.id, 'sourceId')
       await writeFile(join(revisionDir, 'sources', `${source.id}.json`), JSON.stringify(source), 'utf8')
     }
-    listed.push({ readerQuestion: page.readerQuestion, scope: page.scope, relatedPageIds: page.relatedPageIds, kind: page.kind, type: page.type, id: page.id, title: page.title, summary: page.summary, file, parentId: page.parentId ?? null,
+    listed.push({ readerQuestion: page.readerQuestion, scope: page.scope, relatedPageIds: page.relatedPageIds, kind: page.kind, ...(page.isHub ? { isHub: true } : {}), type: page.type, id: page.id, title: page.title, summary: page.summary, file, parentId: page.parentId ?? null,
       quality: page.quality, verification: page.verification, verificationIssues: page.verificationIssues, review: page.review,
       sources: (page.sources ?? []).map(({ text: _, ...source }) => source),
       bytes: Buffer.byteLength(page.content, 'utf8'), related: page.related })

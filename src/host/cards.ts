@@ -26,7 +26,7 @@ export function parseCard(raw: unknown, page: WritePageInput): KnowledgeCard {
     evidence, verification: 'uncertain', issues, version: page.sources?.[0]?.version ?? '' }
 }
 export function verifyPrompts(page: WritePageInput, card: KnowledgeCard) {
-  return { system: `${boundary}\n逐项核对 Wiki 与卡片的关键结论，特别是技术栈、接口、配置、权限、测试是否有给定源码依据。引用行号存在不代表结论成立。同时独立评估页面可读性：relevance（是否回答页面问题、是否越界）、structure（开头结论、章节与段落）、citations（引用是否切碎正文；不要重复统计数量）。只返回 JSON {supported:boolean,issues:string[],review:{pass:boolean,relevance:boolean|null,structure:boolean|null,citations:boolean,issues:string[]}}。任何不能证实或与代码矛盾的结论 supported=false；可读性问题写进 review.issues，不能混入 supported。`, user: JSON.stringify({ page: { title: page.title, summary: page.summary, readerQuestion: page.readerQuestion, scope: page.scope, content: page.content }, card, sources: page.sources }) }
+  return { system: `${boundary}\n逐项核对 Wiki 与卡片的关键结论，特别是技术栈、接口、配置、权限、测试是否有给定源码依据。引用行号存在不代表结论成立。同时独立评估页面可读性：plainLanguage（是否讲人话、无代码逐行翻译、用户页不泄露底层实现符号）、relevance（是否回答页面问题、是否越界）、structure（开头结论、章节与段落）、citations（引用是否放在句末/段末且不切碎正文；不要重复统计数量）。只返回 JSON {supported:boolean,issues:string[],review:{pass:boolean,plainLanguage:boolean|null,relevance:boolean|null,structure:boolean|null,citations:boolean,issues:string[]}}。任何不能证实或与代码矛盾的结论 supported=false；可读性问题写进 review.issues，不能混入 supported。`, user: JSON.stringify({ page: { title: page.title, summary: page.summary, readerQuestion: page.readerQuestion, scope: page.scope, content: page.content }, card, sources: page.sources }) }
 }
 export interface VerificationOutcome {
   supported: boolean
@@ -39,6 +39,7 @@ function parseReview(value: unknown): PageReviewMeta | undefined {
   if (typeof v.pass !== 'boolean' || typeof v.citations !== 'boolean' || !Array.isArray(v.issues)) return undefined
   return {
     pass: v.pass,
+    ...(v.plainLanguage !== undefined ? { plainLanguage: typeof v.plainLanguage === 'boolean' ? v.plainLanguage : null } : {}),
     relevance: typeof v.relevance === 'boolean' ? v.relevance : null,
     structure: typeof v.structure === 'boolean' ? v.structure : null,
     citations: v.citations,

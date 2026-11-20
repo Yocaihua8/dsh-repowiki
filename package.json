@@ -8,7 +8,7 @@
     "zh": "对本地代码仓库生成 DeepWiki 式多页维基：扫描结构、规划页面、逐页用 DSH 已配置模型撰写 Markdown，并在 DSH 原生面板中阅读。",
     "en": "Generates a DeepWiki-style multi-page wiki for a local repository and reads it in a native DSH panel."
   },
-  "version": "0.7.11",
+  "version": "0.7.21",
   "private": true,
   "author": "dsh-link",
   "license": "MIT",

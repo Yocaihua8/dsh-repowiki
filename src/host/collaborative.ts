@@ -4,21 +4,28 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { MessageId, ReasoningEffortId, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Checkpoint } from './checkpoints.js'
-import type { AgentGenerationRuntime, AgentRunner } from './agent-generation.js'
+import { attachRequestRecovery, reuseUnchanged, type AgentGenerationRuntime, type AgentRunner } from './agent-generation.js'
 import { AgentWorkspace, digest, recordPlannerFailure } from './agent-workspace.js'
-import { captureSnapshot, asMaterial, selectMaterial } from './snapshot.js'
-import { coverageMatrix, pageWorkerPrompt, plannerPrompt, verifierPrompt } from './prompts.js'
+import { captureSnapshot, asMaterial, hasWorkingTreeChanged, selectMaterial } from './snapshot.js'
+import { coverageMatrix, pageWorkerPrompt, plannerPrompt, readabilityReviewPrompt, verifierPrompt } from './prompts.js'
 import { aggregateQuality, type PageQuality } from './quality.js'
-import { pageSubmitTool, snapshotTools, verificationTool } from './page-tools.js'
+import { pageSubmitTool, reviewSubmitTool, snapshotTools, verificationTool } from './page-tools.js'
 import { gitState } from './git.js'
 import { WikiError } from './errors.js'
 import { restrictToScopedToolsNatively } from './tool-scope.js'
-import type { CardEvidence, ModelSelection, PageReviewMeta, SourceExcerpt, WikiManifest } from '../shared/types.js'
+import { readManifest, readPageContent, readSourceContent } from './store.js'
+import type { CardEvidence, ModelSelection, PageReviewMeta, SourceExcerpt } from '../shared/types.js'
 import { parseCitations, suspiciousCitations } from './citations.js'
 
 const message = (text: string): UserMessage => ({ id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }], source: { kind: 'repowiki' } })
 const roleModel = (job: Checkpoint, role: 'planner' | 'writer' | 'verifier'): ModelSelection => job.settings.roles?.[role] ?? job.selection
 const agentOptions = (model: ModelSelection) => ({ ...model, reasoningEffort: model.reasoningEffort ? ReasoningEffortId(model.reasoningEffort) : undefined })
+function filterRepowikiContext(scope: Parameters<AgentSetup>[0]): void {
+  scope.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const result = await next()
+    return { ...result, contexts: result.contexts.filter(c => c.name.startsWith('repowiki-')) }
+  })
+}
 function compactSources(content: string, sources: SourceExcerpt[], knownPaths: readonly string[]): SourceExcerpt[] {
   const ranges = new Map<string, { start: number; end: number }>()
   for (const citation of parseCitations(content, { paths: knownPaths, allowBare: true })) {
@@ -63,6 +70,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
     const s = job.status
     s.engine = 'agent-v1'; s.collaboration = 'collaborative'
     s.stage = 'scan'; s.currentAction = '读取源码快照'; await runtime.save()
+    if (job.mode === 'update' && !job.commit) job.commit = (await gitState(s.repoPath!)).commit ?? undefined
     let fixed = await runtime.checkpoints.snapshot(s.jobId!)
     if (!fixed) {
       fixed = await captureSnapshot(s.repoPath!, job.commit, signal, true, job.settings.exclude)
@@ -74,8 +82,9 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
     if (snapshot.source.fingerprint !== digest(snapshot.files.map(file => `${file.path}:${digest(file.text)}`).sort().join('\n'))
       || [...(job.agentState?.evidence ?? []), ...job.pages.flatMap(page => page.sources ?? [])].some(source => !snapshot.files.some(file => file.path === source.path && file.version === source.version
         && source.hash === digest(source.text) && file.text.split('\n').slice(source.startLine - 1, source.endLine).join('\n') === source.text))) throw new WikiError('检查点来源与固定源码快照不一致，已暂停并保留原始数据。', 'repowiki/paused')
-    if (job.mode === 'update') throw new WikiError('协作模式暂不支持增量更新，请使用单 Agent 模式。', 'repowiki/paused')
-    // 版本校验每次工具调用都会触发；Git 身份校验按 3s、工作区全量快照按 10s 节流，
+    const previous = await readManifest(runtime.stateDir, s.wikiId!)
+    if (job.mode === 'update' && previous?.source && previous.source.branch !== snapshot.source.branch) throw new WikiError('分支已切换，请重新生成。', 'repowiki/branch-changed')
+    // 版本校验每次工具调用都会触发；Git 身份校验按 3s、工作区快速元信息校验按 10s 节流，
     // 与单 Agent 引擎保持一致，避免工具密集阶段反复重扫仓库。
     let lastGitCheck = 0, lastWorkingCheck = 0
     const assertVersion = async () => {
@@ -87,11 +96,11 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
       }
       if (snapshot.source.kind === 'working' && Date.now() - lastWorkingCheck >= 10_000) {
         lastWorkingCheck = Date.now()
-        const currentSnapshot = await captureSnapshot(s.repoPath!, undefined, signal, true, job.settings.exclude)
-        if (currentSnapshot.source.fingerprint !== snapshot.source.fingerprint) throw new WikiError('工作区源码已变化，已保留当前草稿；请恢复原版本后继续，或重新生成。', 'repowiki/paused')
+        if (await hasWorkingTreeChanged(snapshot, job.settings.exclude, signal)) throw new WikiError('工作区源码已变化，已保留当前草稿；请恢复原版本后继续，或重新生成。', 'repowiki/paused')
       }
     }
     await assertVersion()
+    if (!job.agentState && previous && await reuseUnchanged(job, snapshot, previous, runtime, signal)) return
     job.agentState ??= { sessionId: `repowiki-${randomUUID()}`, sessionCreated: false, progress: 0, stalledRounds: 0, evidence: [], revisions: [], receipts: {}, verifications: {} }
     const state = job.agentState
     s.agentSessionId = state.sessionId; s.stage = job.outline ? 'pages' : 'analyze'; s.currentAction = job.outline ? '恢复未完成内容' : '分析仓库 / 规划目录'; s.waiting = undefined
@@ -112,7 +121,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
         const plannerTools = new Set(['wiki_files', 'wiki_search', 'wiki_read', 'wiki_previous', 'wiki_outline', 'wiki_status'])
         const definitions = workspace.tools().filter(tool => plannerTools.has(tool.name))
         const planner = roleModel(job, 'planner')
-        const prompts = plannerPrompt({ language: job.settings.language, mode: job.mode, coverage, fileCount: snapshot.files.length })
+        const prompts = plannerPrompt({ language: job.settings.language, mode: job.mode, coverage, fileCount: snapshot.files.length, granularity: job.settings.granularity })
         for (let attempt = 0; attempt < 2 && !job.outline; attempt++) {
           const id = SessionId(`repowiki-${randomUUID()}`)
           state.sessionId = id; state.sessionCreated = false; s.plannerSessionId = id; s.agentSessionId = id; s.currentAction = '规划目录'; await runtime.save()
@@ -122,6 +131,12 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
             scope.tools.guard(exec => names.has(exec.name) ? undefined : '规划子代理只允许只读探索和 wiki_outline。')
             definitions.forEach(tool => scope.tools.register(tool))
             scope.systemPrompt.section({ name: 'repowiki-planner', order: 0, complete: true, interpolate: false, text: prompts.system })
+            filterRepowikiContext(scope)
+            attachRequestRecovery(scope, {
+              signal: attemptAbort.signal,
+              onWait: async waiting => { s.waiting = waiting; await runtime.save() },
+              onTerminal: error => { if (!attemptAbort.signal.aborted) attemptAbort.abort(error) },
+            })
             scope.on('agent/request', async (_payload, next) => {
               const config = await next()
               if (config.provider !== planner.provider || config.model !== planner.model || config.reasoningEffort !== planner.reasoningEffort) throw new WikiError('规划子代理模型配置发生变化，已暂停。', 'repowiki/paused')
@@ -157,6 +172,45 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
       }
       const outline = job.outline!
       const pages = outline.pages.filter(page => page.kind !== 'group')
+      // 协作模式增量更新：对关联源码与元信息均未变化的页面直接复用上一版正文与已核验状态，
+      // 避免对未变化页面重复启动写作与审阅子代理。
+      if (job.mode === 'update' && previous && previous.language === job.settings.language && previous.sourceIndex?.length) {
+        const oldHashes = new Map(previous.sourceIndex.map(entry => [entry.path, entry.hash]))
+        const newFiles = new Map(snapshot.files.map(file => [file.path, file]))
+        for (const page of pages) {
+          if (job.pages.some(written => written.id === page.id)) continue
+          const old = previous.pages.find(entry => entry.id === page.id && entry.kind !== 'group')
+          if (!old?.sources?.length) continue
+          if (old.title !== page.title || old.summary !== page.summary || (old.parentId ?? null) !== (page.parentId ?? null)) continue
+          const related = [...new Set([...old.related, ...page.relatedPaths])]
+          if (related.some(path => !oldHashes.has(path) || oldHashes.get(path) !== newFiles.get(path)?.hash)) continue
+          try {
+            const rebased: SourceExcerpt[] = []
+            let valid = true
+            for (const ref of old.sources) {
+              const source = await readSourceContent(runtime.stateDir, previous, ref.id)
+              const file = newFiles.get(source.path)
+              const text = file?.text.split('\n').slice(source.startLine - 1, source.endLine).join('\n')
+              if (!file || text !== source.text) { valid = false; break }
+              rebased.push({ ...source, version: file.version, id: digest([file.version, file.path, source.startLine, source.endLine, text]).slice(0, 32) })
+            }
+            if (!valid) continue
+            const content = await readPageContent(runtime.stateDir, previous.id, old.id, previous)
+            if (!content) continue
+            const prepared = workspace.evaluatePageFor(page.id, content, rebased)
+            if (prepared.quality.hard.length) continue
+            await serial(async () => {
+              workspace.commitPage(page.id, content, rebased, { quality: prepared.quality, allowSoft: true })
+              workspace.commitRuleVerification('page', page.id)
+              if (old.review?.mode === 'model') workspace.commitReview(page.id, old.review, { revised: old.review.revised })
+              const item = job.status.items?.find(entry => entry.id === page.id)
+              if (item) { item.state = item.bodyState = 'complete'; item.error = null }
+              await runtime.save()
+            })
+            qualities.set(page.id, prepared.quality)
+          } catch { /* 复用失败时回退到正常重新生成 */ }
+        }
+      }
       deadline = setTimeout(() => runController.abort(new WikiError('协作生成超过任务时限，已保存进度；可手动继续。', 'repowiki/paused')), Math.min(runtime.jobTimeoutMs, 180_000 + Math.max(1, pages.length) * 300_000))
       deadline.unref?.()
 
@@ -168,7 +222,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
         for (let attempt = 0; attempt < 2; attempt++) {
           combined.throwIfAborted()
           if (job.pages.some(written => written.id === page.id) && !options.revision) return
-          if (item) { item.attempts = attempt + 1; item.state = item.bodyState = 'writing'; item.error = null; s.currentAction = `撰写 ${page.title}`; s.stage = 'pages'; await runtime.save() }
+          if (item) { item.attempts = attempt + 1; item.state = item.bodyState = 'writing'; item.error = null; s.currentAction = `${options.revision ? '修订' : '撰写'} ${page.title}`; s.stage = 'pages'; await runtime.save() }
           const reads = new Map<string, SourceExcerpt>()
           const prompts = pageWorkerPrompt({ scan: asMaterial(snapshot, selectMaterial(snapshot, page.relatedPaths)), outline, page, language: job.settings.language, revisionIssues: options.revisionIssues })
           let softRetried = false
@@ -206,13 +260,19 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
             scope.tools.guard(exec => names.has(exec.name) ? undefined : '页面子代理只允许只读快照和 submit_page。')
             definitions.forEach(tool => scope.tools.register(tool))
             scope.systemPrompt.section({ name: 'repowiki-page', order: 0, complete: true, interpolate: false, text: prompts.system })
+            filterRepowikiContext(scope)
+            attachRequestRecovery(scope, {
+              signal: child.signal,
+              onWait: async waiting => { s.waiting = waiting; await runtime.save() },
+              onTerminal: error => { childError ??= error; if (!child.signal.aborted) child.abort(error) },
+            })
             scope.on('agent/request', async (_payload, next) => {
               const config = await next()
               if (config.provider !== writer.provider || config.model !== writer.model || config.reasoningEffort !== writer.reasoningEffort) throw new WikiError('页面子代理模型配置发生变化，已暂停。', 'repowiki/paused')
               return config
             })
             scope.on('agent/error', ({ error }) => { childError ??= error })
-            scope.on('agent/turn-stopping', () => { if (!job.pages.some(written => written.id === page.id)) agent.steer(message('请完成本页并调用 submit_page。')) })
+            scope.on('agent/turn-stopping', () => { if (!submitted) agent.steer(message('请完成本页并调用 submit_page。')) })
           }
           const handle = await ctx.agents.create({ sessionId: SessionId(`repowiki-${randomUUID()}`), agentOptions: agentOptions(writer), setup, signal: child.signal, meta: { cwd: snapshot.root, origin: 'subagent', parentSession: s.plannerSessionId ? SessionId(s.plannerSessionId) : undefined, delegationDepth: 1, agentPreset: 'dsh-repowiki' } })
           try {
@@ -230,10 +290,14 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
 
       const pending = pages.filter(page => !job.pages.some(written => written.id === page.id))
       const concurrency = Math.max(1, Math.min(job.settings.concurrency ?? 2, 3, pending.length || 1))
+      const userFacingIds = new Set([
+        ...(outline.readingPaths?.user ?? []),
+        ...pages.filter(p => p.type === 'overview' || p.id === 'overview' || p.type === 'quickstart' || p.type === 'guide' || p.type === 'troubleshooting').map(p => p.id),
+      ])
 
-      // 写作与核验改为页面级流水：一页写完立即进入核验队列，核验与后续写作并行，
-      // 不再等待全部页面写完才启动核验。
-      interface VerifyJob { kind: 'page' | 'card'; id: string; title: string; content: string; sources: SourceExcerpt[]; readerQuestion?: string; scope?: string; summary?: string }
+      // 写作与核验/审阅改为页面级流水：一页写完立即进入队列，核验/审阅与后续写作并行，
+      // 不再等待全部页面写完才启动。
+      interface VerifyJob { kind: 'page' | 'card' | 'review'; id: string; title: string; content: string; sources: SourceExcerpt[]; readerQuestion?: string; scope?: string; summary?: string }
       const verifyJobs: VerifyJob[] = []
       const waiters: Array<() => void> = []
       let verifyCursor = 0, writersDone = false
@@ -244,7 +308,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
         const key = `${kind}:${id}`
         if (state.verifications[key]?.digest === digest(content)) return state.verifications[key]?.review
         const verifier = roleModel(job, 'verifier')
-        const prompts = verifierPrompt({ language: job.settings.language, kind, title, content, readerQuestion: meta.readerQuestion, scope: meta.scope, summary: meta.summary, sources: sources.map(source => ({ sourceId: source.id, path: source.path, startLine: source.startLine, endLine: source.endLine, text: source.text })) })
+        const prompts = verifierPrompt({ language: job.settings.language, kind, title, content, readerQuestion: meta.readerQuestion, scope: meta.scope, summary: meta.summary, isUserFacing: kind === 'page' && userFacingIds.has(id), sources: sources.map(source => ({ sourceId: source.id, path: source.path, startLine: source.startLine, endLine: source.endLine, text: source.text })) })
         let lastError: unknown
         for (let attempt = 0; attempt < 2; attempt++) {
           combined.throwIfAborted()
@@ -257,7 +321,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
           const definitions = [...snapshotTools(snapshot, reads), verificationTool(kind, id, async input => {
             const wanted = new Set(input.claims.flatMap(claim => claim.evidence.map(item => item.sourceId)))
             const outcome = await serial(async () => {
-              const result = workspace.commitVerification(input, [...reads.values()].filter(source => wanted.has(source.id)))
+              const result = workspace.commitVerification(input, [...reads.values()].filter(source => wanted.has(source.id)), { revised: revision })
               await runtime.save()
               return result
             })
@@ -269,13 +333,19 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
             scope.tools.guard(exec => names.has(exec.name) ? undefined : '核验子代理只允许只读快照和 submit_verification。')
             definitions.forEach(tool => scope.tools.register(tool))
             scope.systemPrompt.section({ name: 'repowiki-verifier', order: 0, complete: true, interpolate: false, text: prompts.system })
+            filterRepowikiContext(scope)
+            attachRequestRecovery(scope, {
+              signal: child.signal,
+              onWait: async waiting => { s.waiting = waiting; await runtime.save() },
+              onTerminal: error => { childError ??= error; if (!child.signal.aborted) child.abort(error) },
+            })
             scope.on('agent/request', async (_payload, next) => {
               const config = await next()
               if (config.provider !== verifier.provider || config.model !== verifier.model || config.reasoningEffort !== verifier.reasoningEffort) throw new WikiError('核验子代理模型配置发生变化，已暂停。', 'repowiki/paused')
               return config
             })
             scope.on('agent/error', ({ error }) => { childError ??= error })
-            scope.on('agent/turn-stopping', () => { if (!state.verifications[key]) agent.steer(message('请调用 submit_verification 提交核验。')) })
+            scope.on('agent/turn-stopping', () => { if (state.verifications[key]?.digest !== digest(content)) agent.steer(message('请调用 submit_verification 提交核验。')) })
           }
           s.currentAction = `核验 ${title}`; await runtime.save()
           const handle = await ctx.agents.create({ sessionId: SessionId(`repowiki-${randomUUID()}`), agentOptions: agentOptions(verifier), setup, signal: child.signal, meta: { cwd: snapshot.root, origin: 'subagent', parentSession: s.plannerSessionId ? SessionId(s.plannerSessionId) : undefined, delegationDepth: 1, agentPreset: 'dsh-repowiki' } })
@@ -298,6 +368,7 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
               await runPage(page, { revision: true, revisionIssues: review.issues })
               const next = job.pages.find(entry => entry.id === id)
               if (next && digest(next.content) !== digest(before)) return verifyOne(kind, id, title, next.content, next.sources ?? [], meta, true)
+              await serial(async () => { workspace.commitReview(id, review, { revised: true }); await runtime.save() })
             }
           }
           return review
@@ -307,25 +378,131 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
       }
 
       /**
-       * 页面提交成功后立即处理核验。
+       * 轻量语义可读性审阅：仅在 Host 机械引用校验通过后运行，不读取源码，
+       * 专注检查「是否讲人话、是否切题、结构是否好扫读、引用是否打断阅读」。
+       */
+      const reviewOne = async (id: string, title: string, content: string, meta: { readerQuestion?: string; scope?: string; summary?: string } = {}, revision = false): Promise<PageReviewMeta | undefined> => {
+        const page = pages.find(entry => entry.id === id)
+        if (!page) return undefined
+        const existing = state.verifications[`page:${id}`]
+        if (existing?.digest === digest(content) && existing.review?.mode === 'model') return existing.review
+        const verifier = roleModel(job, 'verifier')
+        const prompts = readabilityReviewPrompt({
+          language: job.settings.language,
+          title,
+          pageType: page.type,
+          isUserFacing: userFacingIds.has(id),
+          content,
+          readerQuestion: meta.readerQuestion,
+          scope: meta.scope,
+          summary: meta.summary,
+        })
+        let committed: PageReviewMeta | undefined
+        let lastError: unknown
+        for (let attempt = 0; attempt < 2 && !committed; attempt++) {
+          combined.throwIfAborted()
+          const child = new AbortController()
+          const onChildAbort = () => child.abort(combined.reason)
+          combined.addEventListener('abort', onChildAbort, { once: true })
+          const timer = setTimeout(() => child.abort(new WikiError('可读性审阅子代理超时。', 'repowiki/paused')), Math.max(runtime.timeoutMs, 10 * 60_000)); timer.unref?.()
+          let childError: unknown
+          const definitions = [reviewSubmitTool(id, async input => {
+            const outcome = await serial(async () => {
+              const saved = workspace.commitReview(id, input, { revised: revision })
+              await runtime.save()
+              return saved
+            })
+            committed = outcome
+            return { done: true as const, review: outcome }
+          })]
+          const setup: AgentSetup = (scope, agent) => {
+            const names = new Set(definitions.map(tool => tool.name))
+            restrictToScopedToolsNatively(scope.tools)
+            scope.tools.guard(exec => names.has(exec.name) ? undefined : '可读性审阅子代理只允许调用 submit_review。')
+            definitions.forEach(tool => scope.tools.register(tool))
+            scope.systemPrompt.section({ name: 'repowiki-reviewer', order: 0, complete: true, interpolate: false, text: prompts.system })
+            filterRepowikiContext(scope)
+            attachRequestRecovery(scope, {
+              signal: child.signal,
+              onWait: async waiting => { s.waiting = waiting; await runtime.save() },
+              onTerminal: error => { childError ??= error; if (!child.signal.aborted) child.abort(error) },
+            })
+            scope.on('agent/request', async (_payload, next) => {
+              const config = await next()
+              if (config.provider !== verifier.provider || config.model !== verifier.model || config.reasoningEffort !== verifier.reasoningEffort) throw new WikiError('审阅子代理模型配置发生变化，已暂停。', 'repowiki/paused')
+              return config
+            })
+            scope.on('agent/error', ({ error }) => { childError ??= error })
+            scope.on('agent/turn-stopping', () => { if (!committed) agent.steer(message('请调用 submit_review 提交可读性审阅结果。')) })
+          }
+          s.currentAction = `核验 ${title}`; await runtime.save()
+          const handle = await ctx.agents.create({ sessionId: SessionId(`repowiki-${randomUUID()}`), agentOptions: agentOptions(verifier), setup, signal: child.signal, meta: { cwd: snapshot.root, origin: 'subagent', parentSession: s.plannerSessionId ? SessionId(s.plannerSessionId) : undefined, delegationDepth: 1, agentPreset: 'dsh-repowiki' } })
+          try {
+            handle.agent.followup(message(prompts.user))
+            await handle.agent.whenIdle()
+            child.signal.throwIfAborted()
+            if (committed) { lastError = undefined; break }
+            lastError = childError ?? new Error('可读性审阅子代理未提交结果。')
+          } catch (error) { lastError = error }
+          finally { clearTimeout(timer); combined.removeEventListener('abort', onChildAbort); await handle.dispose() }
+        }
+        if (!committed) {
+          failures.push(`review:${id}: ${lastError instanceof Error ? lastError.message : String(lastError)}`)
+          return undefined
+        }
+        if (!revision && !committed.pass) {
+          const rewritten = job.pages.find(entry => entry.id === id)
+          if (rewritten) {
+            const before = rewritten.content
+            await runPage(page, { revision: true, revisionIssues: committed.issues })
+            const next = job.pages.find(entry => entry.id === id)
+            if (next && digest(next.content) !== digest(before)) {
+              const nextQuality = qualities.get(page.id) ?? workspace.evaluatePageFor(page.id, next.content, next.sources ?? []).quality
+              const nextSuspicious = suspiciousCitations(next.content, knownPaths)
+              if (nextQuality.hard.length === 0 && nextSuspicious.length === 0) {
+                await serial(async () => {
+                  workspace.commitRuleVerification('page', page.id)
+                  for (const card of job.cards.filter(entry => entry.pageId === page.id)) workspace.commitRuleVerification('card', card.id)
+                  await runtime.save()
+                })
+                return reviewOne(id, title, next.content, meta, true)
+              }
+              return verifyOne('page', id, title, next.content, compactSources(next.content, next.sources ?? [], knownPaths), meta, true)
+            }
+            await serial(async () => { workspace.commitReview(id, committed!, { revised: true }); await runtime.save() })
+          }
+        }
+        return committed
+      }
+
+      /**
+       * 页面提交成功后立即处理核验与可读性审阅。
        *
        * 规则优先：引用可定位、无可疑引用、无硬性质量问题都成立时，
-       * 机械事实已由 Host 校验完毕，直接把核验结果记进检查点，
-       * 不再为这一页启动核验子代理；任一条件不成立才回退到模型核验。
+       * 机械事实由 Host 直接记入检查点（省去逐条 claims 核验开销），
+       * 但仍默认进入轻量可读性审阅队列，确保「讲人话」与修订闭环生效；
+       * 机械检查不通过时回退到完整模型核验。
        */
       const enqueueVerified = async (page: typeof pages[number]) => {
         const written = job.pages.find(entry => entry.id === page.id)
         if (!written) return
-        const quality = qualities.get(page.id)
+        const quality = qualities.get(page.id) ?? workspace.evaluatePageFor(page.id, written.content, written.sources ?? []).quality
+        qualities.set(page.id, quality)
         const suspicious = suspiciousCitations(written.content, knownPaths)
-        const ruleVerifiable = !!quality && quality.hard.length === 0 && suspicious.length === 0
+        const ruleVerifiable = quality.hard.length === 0 && suspicious.length === 0
         if (ruleVerifiable) {
           try {
             await serial(async () => {
-              workspace.commitRuleVerification('page', page.id)
-              for (const card of job.cards.filter(entry => entry.pageId === page.id)) workspace.commitRuleVerification('card', card.id)
+              if (state.verifications[`page:${page.id}`]?.digest !== digest(written.content)) workspace.commitRuleVerification('page', page.id)
+              for (const card of job.cards.filter(entry => entry.pageId === page.id)) {
+                if (state.verifications[`card:${card.id}`]?.digest !== digest(card.content)) workspace.commitRuleVerification('card', card.id)
+              }
               await runtime.save()
             })
+            if (state.verifications[`page:${page.id}`]?.review?.mode !== 'model') {
+              verifyJobs.push({ kind: 'review', id: page.id, title: page.title, content: written.content, sources: [], readerQuestion: page.readerQuestion, scope: page.scope, summary: page.summary })
+              wakeAll()
+            }
             return
           } catch { /* 规则核验失败时继续走模型核验 */ }
         }
@@ -339,11 +516,27 @@ export function collaborativeRunner(ctx: Context): AgentRunner {
 
       const verifyLoop = async () => {
         for (;;) {
-          if (verifyCursor < verifyJobs.length) { const entry = verifyJobs[verifyCursor++]!; await verifyOne(entry.kind, entry.id, entry.title, entry.content, entry.sources, { readerQuestion: entry.readerQuestion, scope: entry.scope, summary: entry.summary }); continue }
+          if (verifyCursor < verifyJobs.length) {
+            const entry = verifyJobs[verifyCursor++]!
+            if (entry.kind === 'review') await reviewOne(entry.id, entry.title, entry.content, { readerQuestion: entry.readerQuestion, scope: entry.scope, summary: entry.summary })
+            else await verifyOne(entry.kind, entry.id, entry.title, entry.content, entry.sources, { readerQuestion: entry.readerQuestion, scope: entry.scope, summary: entry.summary })
+            continue
+          }
           if (writersDone) return
           await waitForWork()
         }
       }
+
+      // 恢复任务时补齐「已写完但尚未完成核验或语义审阅」的页面，避免 publish 时因漏验报错。
+      for (const page of pages) {
+        const written = job.pages.find(entry => entry.id === page.id)
+        if (!written) continue
+        const pageRecord = state.verifications[`page:${page.id}`]
+        const needsPageCheck = pageRecord?.digest !== digest(written.content) || pageRecord.review?.mode !== 'model'
+        const needsCardCheck = job.cards.some(card => card.pageId === page.id && state.verifications[`card:${card.id}`]?.digest !== digest(card.content))
+        if (needsPageCheck || needsCardCheck) await enqueueVerified(page)
+      }
+
       s.stage = pending.length ? 'pages' : 'verify'
       const verifyWorkers = Array.from({ length: Math.max(1, Math.min(concurrency, 3)) }, verifyLoop)
 

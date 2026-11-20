@@ -9,7 +9,22 @@
 export interface ReadingPaths { user: string[]; developer: string[]; maintainer: string[] }
 
 /** 页面类型；Host/Client 与持久化元数据共用。 */
-export type WikiPageType = 'overview' | 'architecture' | 'module' | 'api' | 'data' | 'workflow' | 'config' | 'testing' | 'ops'
+export type WikiPageType =
+  | 'overview'
+  | 'quickstart'
+  | 'guide'
+  | 'developer'
+  | 'architecture'
+  | 'module'
+  | 'api'
+  | 'data'
+  | 'workflow'
+  | 'config'
+  | 'security'
+  | 'testing'
+  | 'ops'
+  | 'troubleshooting'
+  | 'extension'
 
 /** Host 的确定性页面质量结果，随页面元信息持久化。 */
 export interface PageQualityMeta {
@@ -28,11 +43,14 @@ export interface PageQualityMeta {
 /** 模型对页面可读性的语义审阅；与事实核验结论分开保存。 */
 export interface PageReviewMeta {
   pass: boolean
+  plainLanguage?: boolean | null
   relevance: boolean | null
   structure: boolean | null
   citations: boolean
   issues: string[]
   mode: 'model' | 'host-rule'
+  /** 是否已执行过一轮可读性修订；达到修订上限后仍未通过只记警告不阻断发布。 */
+  revised?: boolean
   checkedAt?: string
 }
 
@@ -43,6 +61,8 @@ export interface WikiPageMeta {
 
   contentVersion?: string
   kind?: 'group' | 'page'
+  /** 是否为带有子页面的分类导览页（Hub Page），与 Qoder 目录结构一致。 */
+  isHub?: boolean
   type?: WikiPageType
   parentId?: string | null
   sources?: SourceReference[]
@@ -196,6 +216,8 @@ export interface ProjectSettings {
   autoExport: boolean
   collaboration?: 'single' | 'collaborative'
   concurrency?: 1 | 2 | 3
+  /** 目录粒度：standard（标准，约 18–26 页）或 deep（深度，按子系统细拆至 30–45 页）。 */
+  granularity?: 'standard' | 'deep'
   roles?: RoleModels
   /** 手工排除规则（.gitignore 语法），扫描时先于文件树与快照生效。 */
   exclude?: string[]

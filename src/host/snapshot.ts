@@ -7,7 +7,15 @@ import { commitFiles, gitState, readCommitFile } from './git.js'
 import { decodeBounded, excludeMatcher, isAllowedPath, isSourcePath, pickExcerpts, readExcerpts, scanRepo, SCAN_LIMITS, type ScanMaterial } from './scanner.js'
 import { WikiError } from './errors.js'
 
-export interface RepositorySnapshot { root: string; tree: string[]; files: SourceExcerpt[]; source: RepositoryVersion; truncated: boolean }
+export interface RepositorySnapshot {
+  root: string
+  tree: string[]
+  files: SourceExcerpt[]
+  source: RepositoryVersion
+  truncated: boolean
+  /** 工作区快照的文件元信息（size + mtimeMs），用于快速变更检测，避免反复全量读盘哈希。 */
+  fileStats?: Record<string, { size: number; mtimeMs: number }>
+}
 const hash = (text: string): string => createHash('sha256').update(text).digest('hex')
 const SNAPSHOT_BUDGET = 8 * 1024 * 1024
 /**
@@ -85,7 +93,37 @@ export async function captureSnapshot(root: string, commit: string | undefined, 
   const version = commit ?? `working-${fingerprint.slice(0, 12)}`
   const files = texts.map(file => ({ id: hash(`${version}\0${file.path}\0${file.text}`).slice(0, 32), path: file.path,
     startLine: 1, endLine: file.text.split('\n').length, hash: hash(file.text), version, text: file.text }))
-  return { root, tree, files, source: { kind: commit ? 'git' : 'working', commit: commit ?? state.commit, branch: state.branch, fingerprint }, truncated: truncated || texts.some(f => f.truncated) }
+  let fileStats: Record<string, { size: number; mtimeMs: number }> | undefined
+  if (!commit) {
+    const entries = await Promise.all(files.map(async file => {
+      const info = await stat(join(root, file.path)).catch(() => null)
+      return info ? [file.path, { size: info.size, mtimeMs: info.mtimeMs }] as const : null
+    }))
+    fileStats = Object.fromEntries(entries.filter((entry): entry is readonly [string, { size: number; mtimeMs: number }] => entry !== null))
+  }
+  return { root, tree, files, source: { kind: commit ? 'git' : 'working', commit: commit ?? state.commit, branch: state.branch, fingerprint }, truncated: truncated || texts.some(f => f.truncated), ...(fileStats ? { fileStats } : {}) }
+}
+
+/**
+ * 工作区快速变更检测：先比对文件树与各文件 `size + mtimeMs`，
+ * 全部未变化时直接返回 false，避免长任务期间每 10 秒全量读盘与 SHA-256 计算；
+ * 仅当存在增删改或旧快照缺少元信息时回退到内容指纹比对。
+ */
+export async function hasWorkingTreeChanged(snapshot: RepositorySnapshot, exclude: readonly string[] | undefined, signal: AbortSignal): Promise<boolean> {
+  if (snapshot.source.kind !== 'working') return false
+  if (snapshot.fileStats) {
+    const limits = { ...SCAN_LIMITS, maxFileBytes: 8 * 1024 * 1024, totalBudgetBytes: AGENT_READ_BUDGET }
+    const scan = await scanRepo(snapshot.root, { ...limits, exclude }, signal)
+    if (!scan.treeTruncated && scan.tree.length === snapshot.tree.length && scan.tree.every((entry, index) => entry === snapshot.tree[index])) {
+      const checks = await Promise.all(Object.entries(snapshot.fileStats).map(async ([path, prev]) => {
+        const info = await stat(join(snapshot.root, path)).catch(() => null)
+        return !!info && info.size === prev.size && info.mtimeMs === prev.mtimeMs
+      }))
+      if (checks.every(Boolean)) return false
+    }
+  }
+  const current = await captureSnapshot(snapshot.root, undefined, signal, true, exclude)
+  return current.source.fingerprint !== snapshot.source.fingerprint
 }
 
 export function selectMaterial(snapshot: RepositorySnapshot, wanted: string[] = [], budget = SCAN_LIMITS.totalBudgetBytes): SourceExcerpt[] {

@@ -72,15 +72,7 @@ export function ListPage(props: {
   return (
     <div>
       <div className="drw-hero">
-        <h1 className="drw-hero-title">{t('hero1')}
-          <span className="drw-hero-accent"><I name="book-open" size={20} />{t('heroBrand')}</span></h1>
-        <p className="drw-hero-sub">{t('hero2')}</p>
-        <div className="drw-hero-decor" aria-hidden="true">
-          <span className="drw-decor drw-decor-ring" style={{ left: 0, top: 20 }}><I name="flower" size={18} /></span>
-          <span className="drw-decor drw-decor-card" style={{ left: 60, top: 8 }}><I name="share-2" size={24} /></span>
-          <span className="drw-decor drw-decor-chip" style={{ right: 104, top: 46 }}><I name="code-xml" size={15} /></span>
-          <span className="drw-decor drw-decor-ring" style={{ right: 26, top: 8 }}><I name="leaf" size={18} /></span>
-        </div>
+        <h1 className="drw-hero-title"><span className="drw-hero-accent"><I name="book-open" size={20} />{t('heroBrand')}</span></h1>
       </div>
       <div className="drw-listbar">
         <SegmentedControl id="drw-project-filter" value={props.filter} label={t('filterAll')} options={(['all','done','none'] as const).map(value => ({ value, label: ui[value] }))} onChange={v => props.onFilter(v as typeof props.filter)} />

@@ -10,7 +10,7 @@ const sourceId = z.string().regex(/^[a-f0-9]{32}$/)
 const evidence = z.object({ sourceId, path: short, startLine: z.number().int().positive(), endLine: z.number().int().positive(), quote: z.string().min(1).max(6000) })
 const claim = z.object({ claim: short, evidence: z.array(evidence).min(1) })
 const claimList = z.array(claim).min(1)
-function parseJsonArray(value: string): unknown {
+export function parseJsonArray(value: string): unknown {
   try { return JSON.parse(value) } catch { /* Repair unescaped quotes from tool-calling models. */ }
   let repaired = '', inString = false
   for (let i = 0; i < value.length; i++) {
@@ -32,6 +32,7 @@ const verificationClaim = z.object({ claim: short, evidence: z.array(verificatio
 const verificationClaimsInput = jsonArray(z.array(verificationClaim).min(1))
 const reviewInput = z.object({
   pass: z.boolean(),
+  plainLanguage: z.boolean().nullable().optional(),
   relevance: z.boolean().nullable(),
   structure: z.boolean().nullable(),
   citations: z.boolean(),
@@ -58,7 +59,15 @@ export interface VerificationSubmitInput {
   supported: boolean
   issues: string[]
   claims: { claim: string; evidence: { sourceId: string; path: string; startLine: number; endLine: number }[] }[]
-  review?: { pass: boolean; relevance: boolean | null; structure: boolean | null; citations: boolean; issues: string[] }
+  review?: ReviewSubmitInput
+}
+export interface ReviewSubmitInput {
+  pass: boolean
+  plainLanguage?: boolean | null
+  relevance: boolean | null
+  structure: boolean | null
+  citations: boolean
+  issues: string[]
 }
 
 /** Read-only snapshot tools for one page worker. Reads stay local until submit. */
@@ -104,6 +113,16 @@ export function verificationTool(kind: 'page' | 'card', id: string, submit: (inp
   return tool('submit_verification', '提交本页/卡片的关键结论、支持状态与源码行号，并单独提交可读性审阅 review；Host 会按行号提取原文并校验成果版本。evidence 不需要 quote。', z.object({ supported: z.boolean(), issues: z.array(short), claims: verificationClaimsInput, review: reviewInput.optional() }), async (a, exec) => {
     if (submitted) throw new Error('核验已提交。')
     const result = await submit({ kind, id, supported: a.supported, issues: a.issues, claims: a.claims, review: a.review })
+    submitted = true; exec.concludeTurn(); return result
+  })
+}
+
+/** Lightweight semantic readability reviewer submits only the review result (no source reads). */
+export function reviewSubmitTool(id: string, submit: (input: ReviewSubmitInput) => Promise<{ done: true; review: ReviewSubmitInput }>): ToolDefinition {
+  let submitted = false
+  return tool('submit_review', '提交本页的可读性与人话表达审阅结果（pass/plainLanguage/relevance/structure/citations/issues）。', reviewInput, async (a, exec) => {
+    if (submitted) throw new Error('审阅已提交。')
+    const result = await submit(a)
     submitted = true; exec.concludeTurn(); return result
   })
 }

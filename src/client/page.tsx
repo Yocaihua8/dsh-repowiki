@@ -1,14 +1,19 @@
 import { citedFiles, sourceLabel, readingCitations } from './reading-evidence.js'
 import { routePages, type ReadingRoute } from '../shared/reading.js'
 import { ModelPicker } from './model-picker.js'
+import { BranchedMenu } from './branched-menu.js'
+import type { BranchedMenuChild, BranchedMenuItem, BranchedMenuState } from './branched-menu.js'
 import { WikiIcon } from './icons.js'
 import { SourceView } from './source.js'
-import { NativeSelect } from './select.js'
-import { Knowledge, References } from './knowledge.js'
+import { GooeyNav } from './gooey-nav.js'
+import { Knowledge } from './knowledge.js'
 import { MermaidMarkdown } from './mermaid.js'
+import { StatusMark } from './status-mark.js'
+import { ThoughtLine } from './thought-line.js'
+import { buildTaskTrace, formatTaskDeciseconds, generationSettingsEqual, generationSettingsKey, shouldRetryIncrementalLabel, statusToMark } from './task-trace.js'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ReactElement } from 'react'
-import { Button, MarkdownDelegateProvider, Switch, Input, SegmentedControl } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { ReactElement, ReactNode } from 'react'
+import { Button, MarkdownDelegateProvider, Modal, Switch, Input, SegmentedControl } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { GenerationStatus, ModelCapabilities, ModelSelection, ProjectConfiguration, ProjectEntry, ProjectSettings, SourceExcerpt, StoragePlan, WikiManifest, WikiPageMeta } from '../shared/types.js'
 import { call, refreshJobs, useJobs, type PanelContext, type RepoWikiRemote } from './jobs.js'
 import { ListPage } from './overview.js'
@@ -33,40 +38,183 @@ function RetryStatus({ status }: { status: GenerationStatus }) {
   return <>{status.waiting.reason} · {u('重试', 'Retry')} {status.waiting.attempt}/3 · {Math.max(0, Math.ceil((Date.parse(status.waiting.retryAt) - Date.now()) / 1000))}s</>
 }
 
-function Progress({ status, onCancel, onPause, onResume, busy, modelLabel }: { modelLabel?: string; status: GenerationStatus; onCancel: () => void; onPause: () => void; onResume: () => void; busy: boolean }): ReactElement {
+function Progress({ status, onCancel, onPause, onResume, busy, modelLabel, actions }: { modelLabel?: string; status: GenerationStatus; onCancel: () => void; onPause: () => void; onResume: () => void; busy: boolean; actions?: ReactNode }): ReactElement {
   const u = useText()
   const [, clock] = useState(0)
-  useEffect(() => { const timer = window.setInterval(() => clock(n => n + 1), 1000); return () => window.clearInterval(timer) }, [])
+  useEffect(() => {
+    if (!status.running) return undefined
+    const timer = window.setInterval(() => clock(n => n + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [status.running])
   const elapsed = status.startedAt ? Math.max(0, Math.floor(((status.finishedAt ? Date.parse(status.finishedAt) : Date.now()) - Date.parse(status.startedAt)) / 1000)) : 0
+  const mark = statusToMark(status)
+  const trace = buildTaskTrace(status, u)
+  const markLabels = {
+    pending: u('等待中', 'Pending'),
+    running: u('生成中', 'In progress'),
+    done: u('已完成', 'Completed'),
+    failed: u('生成失败', 'Failed'),
+    cancelled: u('已取消', 'Cancelled'),
+  }
+  const failedItems = status.items?.filter(i => i.state === 'failed') ?? []
+  const metaFooter = (
+    <div className="drw-task-meta">
+      <p><span>{u('模型', 'Model')}</span>{modelLabel ?? '—'}{status.model?.reasoningEffort ? ` · ${status.model.reasoningEffort}` : ''}</p>
+      <p><span>{u('最近保存', 'Last saved')}</span>{status.checkpointAt ? new Date(status.checkpointAt).toLocaleString() : '—'}</p>
+      {!status.error && !status.running && status.plannerHint && <p className="drw-task-hint">{status.plannerHint.lastError}</p>}
+      {!!failedItems.length && (
+        <div className="drw-task-failed">
+          {failedItems.map(i => (
+            <p key={i.id} className="drw-task-failed-item">
+              <StatusMark status="failed" size={14} strokeWidth={2} strike={false} labels={markLabels} />
+              <span>{i.title}{i.error ? ` · ${i.error}` : ''}</span>
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+  const hasHeaderActions = Boolean(actions) || (status.running && !status.result) || (!status.running && status.recoverable)
   return <section className="drw-progress drw-task-summary">
-    <div className="drw-spread"><div><span className="drw-section-label">{u('当前任务', 'Current task')}</span><h2><Stage status={status} /></h2></div><span className="drw-muted">{Math.floor(elapsed / 60)}m {elapsed % 60}s</span></div>
+    <div className="drw-task-header">
+      <div className="drw-task-header-main">
+        <span className="drw-section-label">{u('当前任务', 'Current task')}</span>
+        <div className="drw-task-headline">
+          <StatusMark
+            status={mark.status}
+            progress={mark.progress}
+            color={status.running ? 'var(--drw-brand)' : 'currentColor'}
+            size={22}
+            strokeWidth={2}
+            strike={false}
+            labels={markLabels}
+          />
+          <h2><Stage status={status} /></h2>
+        </div>
+      </div>
+      {hasHeaderActions && (
+        <div className="drw-actions drw-task-actions">
+          {actions}
+          {status.running && !status.result && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="drw-task-iconbtn"
+                disabled={busy}
+                aria-label={u('暂停任务', 'Pause task')}
+                title={u('暂停任务', 'Pause task')}
+                onClick={onPause}
+              >
+                <WikiIcon name="pause" size={14} />
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="drw-task-iconbtn"
+                disabled={busy}
+                aria-label={u('取消任务', 'Cancel task')}
+                title={u('取消任务', 'Cancel task')}
+                onClick={onCancel}
+              >
+                <WikiIcon name="cancel" size={14} />
+              </Button>
+            </>
+          )}
+          {!status.running && status.recoverable && (
+            <Button variant="primary" disabled={busy} onClick={onResume}>
+              {['failed', 'partial'].includes(status.stage) ? u('重试未完成项', 'Retry unfinished') : u('继续任务', 'Resume')}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+    {!!status.pagesTotal && (
+      <div className="drw-task-progress-row">
+        <p className="drw-muted drw-task-count">{status.pagesDone} / {status.pagesTotal} {u('页已生成', 'pages generated')}{!!status.cardsDone && ` · ${status.cardsDone} ${u('张知识卡片', 'cards')}`}</p>
+        {status.running && mark.progress !== undefined && <span className="drw-muted drw-task-percent">{Math.round(mark.progress * 100)}%</span>}
+      </div>
+    )}
     {status.running && <progress aria-label={u('生成进度', 'Generation progress')} max={status.pagesTotal + 1} value={status.pagesTotal ? status.pagesDone + (status.result ? 1 : 0) : undefined} />}
-    {!!status.pagesTotal && <p className="drw-muted">{status.pagesDone} / {status.pagesTotal} {u('页已生成', 'pages generated')}{!!status.cardsDone && ` · ${status.cardsDone} ${u('张知识卡片', 'cards')}`}</p>}
+    <div className="drw-task-trace">
+      <ThoughtLine
+        working={status.running}
+        label={trace.label}
+        doneLabel={trace.doneLabel}
+        steps={trace.steps}
+        elapsed={elapsed}
+        formatTime={formatTaskDeciseconds}
+        fontSize={13}
+        collapsible
+        collapseOnSettle
+        showTimer
+        footer={metaFooter}
+      />
+    </div>
     {status.waiting && <p className="drw-notice"><RetryStatus status={status} /></p>}
     {status.error && <p role="alert" className="drw-alert">{status.error.message}</p>}
     {status.warning && <p role="status" className="drw-notice">{status.warning}</p>}
-    <div className="drw-task-controls"><div className="drw-actions">
-      {status.running && !status.result && <><Button variant="outline" disabled={busy} onClick={onPause}>{u('暂停', 'Pause')}</Button><Button variant="ghost" disabled={busy} onClick={onCancel}>{u('取消任务', 'Cancel task')}</Button></>}
-      {!status.running && status.recoverable && <Button variant="primary" disabled={busy} onClick={onResume}>{['failed', 'partial'].includes(status.stage) ? u('重试未完成项', 'Retry unfinished') : u('继续任务', 'Resume')}</Button>}
-    </div><details className="drw-task-details"><summary>{u('任务详情', 'Task details')}</summary><div>
-      {status.currentAction && <p>{status.currentAction}</p>}<p>{modelLabel ?? '—'}{status.model?.reasoningEffort ? ` · ${status.model.reasoningEffort}` : ''}</p>
-      <p>{u('最近保存', 'Last saved')}：{status.checkpointAt ? new Date(status.checkpointAt).toLocaleString() : '—'}</p>
-      {!status.error && !status.running && status.plannerHint && <p>{status.plannerHint.lastError}</p>}
-      {status.items?.filter(i => i.state === 'failed').map(i => <p key={i.id}>{i.title} · {i.error}</p>)}
-    </div></details></div>
   </section>
 }
 
-function Configuration({ config, models, busy, running, project, wiki, task, remote, onSave, onStart, onReloadModels }: {
+type AutoSaveSwitchKey = 'autoUpdate' | 'autoExport' | 'agentReference'
+
+/** 生成设置里的 GooeyNav 选择器：把字符串/数字值映射到组件下标。 */
+function GooeySetting<T extends string | number>({ value, options, onChange, ariaLabel, disabled = false }: {
+  value: T
+  options: readonly { value: T; label: string }[]
+  onChange: (value: T) => void
+  ariaLabel: string
+  disabled?: boolean
+}): ReactElement {
+  const found = options.findIndex(option => option.value === value)
+  return <GooeyNav
+    items={options.map(option => ({ label: option.label }))}
+    activeIndex={found < 0 ? 0 : found}
+    onChange={index => { const option = options[index]; if (option) onChange(option.value) }}
+    theme="auto"
+    size="sm"
+    frame
+    particleCount={12}
+    spread={36}
+    animationTime={520}
+    timeVariance={220}
+    gooeyness={0.55}
+    wobble={0.45}
+    ariaLabel={ariaLabel}
+    mode="selection"
+    disabled={disabled}
+    className="drw-gn-setting"
+  />
+}
+
+function Configuration({ config, models, busy, running, project, wiki, remote, onSave, onToggleSwitch, onReloadModels }: {
   config: ProjectConfiguration; models: ModelCapabilities | null; busy: boolean; running: boolean; remote: RepoWikiRemote
-  project: ProjectEntry; wiki: WikiManifest | null; task?: GenerationStatus
-  onSave: (settings: ProjectSettings, start: boolean) => void; onStart: () => void
+  project: ProjectEntry; wiki: WikiManifest | null
+  onSave: (settings: ProjectSettings, start: boolean) => void
+  onToggleSwitch: (key: AutoSaveSwitchKey, value: boolean) => Promise<void>
   onReloadModels: () => void
 }): ReactElement {
   const u = useText()
   const [settings, setSettings] = useState(config.settings)
   const [modelNotice, setModelNotice] = useState('')
-  useEffect(() => { setSettings(config.settings) }, [config.path])
+  const [confirmRegen, setConfirmRegen] = useState(false)
+  const [optimisticSwitches, setOptimisticSwitches] = useState<Partial<Record<AutoSaveSwitchKey, boolean>>>({})
+  const [savingSwitch, setSavingSwitch] = useState<AutoSaveSwitchKey | null>(null)
+  const [savedSwitch, setSavedSwitch] = useState<AutoSaveSwitchKey | null>(null)
+  const savedTimer = useRef<number | undefined>(undefined)
+  const configGenKey = generationSettingsKey(config.settings)
+  useEffect(() => {
+    setSettings(config.settings)
+    setModelNotice('')
+  }, [config.path, configGenKey])
+  useEffect(() => {
+    setOptimisticSwitches({})
+    setSavingSwitch(null)
+    setSavedSwitch(null)
+    setConfirmRegen(false)
+  }, [config.path])
+  useEffect(() => () => { if (savedTimer.current) window.clearTimeout(savedTimer.current) }, [])
   const change = <K extends keyof ProjectSettings>(key: K, value: ProjectSettings[K]) => setSettings(s => ({ ...s, [key]: value }))
   const changeRole = (role: 'planner' | 'writer' | 'verifier', value: ModelSelection | null) => setSettings(s => ({ ...s, roles: { ...(s.roles ?? {}), [role]: value } }))
   const changeModel = (value: ModelSelection | null) => {
@@ -78,28 +226,58 @@ function Configuration({ config, models, busy, running, project, wiki, task, rem
     setModelNotice(prior && !effort ? u('新模型不支持原思考强度，已改为模型默认。', 'The new model does not support the previous reasoning effort; using the model default.') : '')
     change('model', { provider: value.provider, model: value.model, ...(effort ? { reasoningEffort: effort } : {}) })
   }
+  const toggleInstant = (key: AutoSaveSwitchKey, value: boolean) => {
+    setOptimisticSwitches(prev => ({ ...prev, [key]: value }))
+    setSavingSwitch(key)
+    setSavedSwitch(current => (current === key ? null : current))
+    void onToggleSwitch(key, value).then(() => {
+      setOptimisticSwitches(prev => { const next = { ...prev }; delete next[key]; return next })
+      setSavedSwitch(key)
+      if (savedTimer.current) window.clearTimeout(savedTimer.current)
+      savedTimer.current = window.setTimeout(() => setSavedSwitch(current => (current === key ? null : current)), 1800)
+    }).catch(() => {
+      setOptimisticSwitches(prev => { const next = { ...prev }; delete next[key]; return next })
+    }).finally(() => {
+      setSavingSwitch(current => (current === key ? null : current))
+    })
+  }
   const effective = settings.model ?? models?.defaultModel
   const selected = models?.models.find(m => m.provider === effective?.provider && m.model === effective.model)
   const hasWiki = !!(wiki || project.wiki)
+  const isDirty = !generationSettingsEqual(settings, config.settings)
+  const mergedSettings: ProjectSettings = {
+    ...config.settings,
+    language: settings.language,
+    granularity: settings.granularity,
+    model: settings.model,
+    maxPages: settings.maxPages,
+    collaboration: settings.collaboration,
+    concurrency: settings.concurrency,
+    roles: settings.roles,
+    exclude: settings.exclude,
+  }
+  const autoUpdateChecked = optimisticSwitches.autoUpdate ?? config.settings.autoUpdate
+  const autoExportChecked = optimisticSwitches.autoExport ?? config.settings.autoExport
+  const agentRefChecked = optimisticSwitches.agentReference ?? (config.settings.agentReference === true)
+  const switchDisabled = busy || savingSwitch !== null
   return <section className="drw-config drw-overview">
     <h2>{u('生成设置', 'Generation settings')}</h2>
-    <div className="drw-setting"><span>{u('语言', 'Language')}</span><SegmentedControl id="drw-language" label={u('生成语言', 'Language')} value={settings.language} onChange={v => change('language', v as 'zh' | 'en')} options={[{value:'zh',label:'简体中文'},{value:'en',label:'English'}]} /></div>
-    <div className="drw-settings">
-      <div className="drw-setting drw-model-field"><span>{u('生成模型', 'Model')}</span><ModelPicker models={models} value={settings.model} onChange={changeModel} disabled={busy} u={u} /></div>
-      {modelNotice && <p className="drw-notice">{modelNotice}</p>}
-      <div className="drw-setting"><span>{u('自动更新', 'Auto update')}<small>{config.git.available ? u('每 60 秒检查 Git 提交，按源码变化更新。', 'Checks Git commits every 60 seconds and updates affected pages.') : u('仅支持已有提交的 Git 仓库。', 'Requires a Git repository with a commit.')}</small></span><Switch label={u('自动更新', 'Auto update')} checked={settings.autoUpdate} disabled={!config.git.available || busy} onChange={v => change('autoUpdate', v)} /></div>
-      <div className="drw-setting"><span>{u('自动导出', 'Auto export')}<small>{u('保存到', 'Save to')} .dsh/repowiki/{settings.language}/<br />{u('遇到人工修改时停止覆盖。', 'Stops on manually edited files.')}</small></span><Switch label={u('自动导出', 'Auto export')} checked={settings.autoExport} disabled={busy} onChange={v => change('autoExport', v)} /></div>
-    </div>
-    <div className="drw-setting"><span>{u('自动引用', 'Automatic references')}<small>{u('在当前项目对话中引用已发布的知识。', 'Use published knowledge in project conversations.')}</small></span><Switch label={u('自动引用', 'Automatic references')} checked={settings.agentReference === true} disabled={busy} onChange={v => change('agentReference', v)} /></div>
+    <div className="drw-setting"><span>{u('语言', 'Language')}</span><GooeySetting value={settings.language} options={[{ value: 'zh', label: '简体中文' }, { value: 'en', label: 'English' }] as const} onChange={v => change('language', v)} ariaLabel={u('生成语言', 'Language')} disabled={busy} /></div>
+    <div className="drw-setting"><span>{u('目录粒度', 'Granularity')}<small>{u('标准约 18–26 页；深度会按子系统细拆并更耗时', 'Standard ~18–26 pages; deep splits subsystems further')}</small></span><GooeySetting value={settings.granularity ?? 'standard'} options={[{ value: 'standard', label: u('标准', 'Standard') }, { value: 'deep', label: u('深度', 'Deep') }] as const} onChange={v => change('granularity', v)} ariaLabel={u('目录粒度', 'Granularity')} disabled={busy} /></div>
+    <div className="drw-setting drw-model-field"><span>{u('生成模型', 'Model')}</span><ModelPicker models={models} value={settings.model} onChange={changeModel} disabled={busy} u={u} /></div>
+    {modelNotice && <p className="drw-notice">{modelNotice}</p>}
+    <div className="drw-setting"><span>{u('自动更新', 'Auto update')}<small>{!config.git.available ? u('仅支持已有提交的 Git 仓库', 'Requires a Git repository with commits') : u('Git 有新提交时在后台自动增量更新', 'Automatically update when new Git commits appear')}</small></span><div className="drw-switch-cell">{savedSwitch === 'autoUpdate' && <span className="drw-switch-saved" role="status">{u('已保存', 'Saved')}</span>}<Switch label={u('自动更新', 'Auto update')} checked={autoUpdateChecked} disabled={!config.git.available || switchDisabled} onChange={v => toggleInstant('autoUpdate', v)} /></div></div>
+    <div className="drw-setting"><span>{u('自动导出', 'Auto export')}<small>{u(`自动导出 Markdown 至 .dsh/repowiki/${settings.language}/`, `Export Markdown to .dsh/repowiki/${settings.language}/`)}</small></span><div className="drw-switch-cell">{savedSwitch === 'autoExport' && <span className="drw-switch-saved" role="status">{u('已保存', 'Saved')}</span>}<Switch label={u('自动导出', 'Auto export')} checked={autoExportChecked} disabled={switchDisabled} onChange={v => toggleInstant('autoExport', v)} /></div></div>
+    <div className="drw-setting"><span>{u('自动引用', 'Automatic references')}<small>{u('对话时自动向主会话注入相关知识卡片', 'Inject relevant knowledge cards into main sessions')}</small></span><div className="drw-switch-cell">{savedSwitch === 'agentReference' && <span className="drw-switch-saved" role="status">{u('已保存', 'Saved')}</span>}<Switch label={u('自动引用', 'Automatic references')} checked={agentRefChecked} disabled={switchDisabled} onChange={v => toggleInstant('agentReference', v)} /></div></div>
     <details className="drw-advanced-settings"><summary>{u('高级设置', 'Advanced settings')}</summary>
-      <div className="drw-setting"><span>{u('协作生成', 'Collaborative generation')}<small>{u('逐页子代理独立探索与写作；保留单 Agent 回退。', 'One subagent per page with independent exploration; single-agent fallback remains.')}</small></span><Switch label={u('协作生成', 'Collaborative generation')} checked={settings.collaboration !== 'single'} disabled={busy} onChange={v => change('collaboration', v ? 'collaborative' : 'single')} /></div>
+      <div className="drw-setting"><span>{u('协作生成', 'Collaborative generation')}</span><Switch label={u('协作生成', 'Collaborative generation')} checked={settings.collaboration !== 'single'} disabled={busy} onChange={v => change('collaboration', v ? 'collaborative' : 'single')} /></div>
       {settings.collaboration !== 'single' && <>
-        <div className="drw-setting"><span>{u('并发子代理', 'Subagent concurrency')}<small>{u('建议 2；过高会增加限流和等待。', '2 is recommended; higher values increase rate limits and waiting.')}</small></span><NativeSelect aria-label={u('并发子代理', 'Subagent concurrency')} value={String(settings.concurrency ?? 2)} onChange={e => change('concurrency', Number(e.target.value) as 1 | 2 | 3)}><option value="1">1</option><option value="2">2</option><option value="3">3</option></NativeSelect></div>
-        <div className="drw-setting drw-model-field"><span>{u('规划模型', 'Planner model')}<small>{u('留空跟随项目模型。', 'Empty follows the project model.')}</small></span><ModelPicker models={models} value={settings.roles?.planner ?? null} onChange={v => changeRole('planner', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
-        <div className="drw-setting drw-model-field"><span>{u('写作模型', 'Writer model')}<small>{u('留空跟随项目模型。', 'Empty follows the project model.')}</small></span><ModelPicker models={models} value={settings.roles?.writer ?? null} onChange={v => changeRole('writer', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
-        <div className="drw-setting drw-model-field"><span>{u('核验模型', 'Verifier model')}<small>{u('留空跟随项目模型。', 'Empty follows the project model.')}</small></span><ModelPicker models={models} value={settings.roles?.verifier ?? null} onChange={v => changeRole('verifier', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
+        <div className="drw-setting"><span>{u('并发子代理', 'Subagent concurrency')}</span><GooeySetting value={settings.concurrency ?? 2} options={[{ value: 1, label: '1' }, { value: 2, label: '2' }, { value: 3, label: '3' }] as const} onChange={v => change('concurrency', v)} ariaLabel={u('并发子代理', 'Subagent concurrency')} disabled={busy} /></div>
+        <div className="drw-setting drw-model-field"><span>{u('规划模型', 'Planner model')}</span><ModelPicker models={models} value={settings.roles?.planner ?? null} onChange={v => changeRole('planner', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
+        <div className="drw-setting drw-model-field"><span>{u('写作模型', 'Writer model')}</span><ModelPicker models={models} value={settings.roles?.writer ?? null} onChange={v => changeRole('writer', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
+        <div className="drw-setting drw-model-field"><span>{u('核验模型', 'Verifier model')}</span><ModelPicker models={models} value={settings.roles?.verifier ?? null} onChange={v => changeRole('verifier', v)} disabled={busy} u={u} inheritLabel={u('跟随项目模型', 'Follow project model')} /></div>
       </>}
-      {!!selected?.efforts.length && <div className="drw-setting"><span>{u('思考强度', 'Reasoning effort')}</span><NativeSelect aria-label={u('思考强度', 'Reasoning effort')} value={effective?.reasoningEffort ?? ''} onChange={e => change('model', { provider: selected.provider, model: selected.model, reasoningEffort: e.target.value || undefined })}><option value="">{u('模型默认', 'Model default')}</option>{selected.efforts.map(e => <option key={e} value={e}>{selected.effortOptions?.find(o => o.id === e)?.name ?? e}</option>)}</NativeSelect></div>}
+      {!!selected?.efforts.length && <div className="drw-setting"><span>{u('思考强度', 'Reasoning effort')}</span><GooeySetting value={effective?.reasoningEffort ?? ''} options={[{ value: '', label: u('模型默认', 'Model default') }, ...selected.efforts.map(e => ({ value: e, label: selected.effortOptions?.find(o => o.id === e)?.name ?? e }))]} onChange={v => change('model', { provider: selected.provider, model: selected.model, reasoningEffort: v || undefined })} ariaLabel={u('思考强度', 'Reasoning effort')} disabled={busy} /></div>}
       <StoragePanel remote={remote} u={u} />
       <Button variant="ghost" size="sm" disabled={busy} onClick={onReloadModels}>{u('刷新模型列表', 'Refresh models')}</Button>
     </details>
@@ -107,9 +285,41 @@ function Configuration({ config, models, busy, running, project, wiki, task, rem
 
     {!config.canGenerate && <p role="status" className="drw-notice">{config.reason}</p>}
     {config.updateNotice && <p className="drw-notice">{config.updateNotice}</p>}
-    {running && <p className="drw-muted">{u('当前任务使用启动时的配置；修改只影响后续任务。', 'The current task keeps its initial settings. Changes apply to future tasks.')}</p>}
-    <div className="drw-actions drw-settings-save"><Button variant="outline" disabled={busy} onClick={() => onSave(settings, false)}>{u('保存设置', 'Save settings')}</Button>{!running && <Button variant="primary" disabled={busy || !config.canGenerate || !models || !!settings.model && !selected} onClick={() => onSave(settings, true)}>{hasWiki ? u('重新生成', 'Regenerate') : u('开始生成', 'Generate')}</Button>}</div>
+    <div className="drw-actions drw-settings-save">
+      {isDirty && <span className="drw-dirty-hint">{u('生成参数有未保存的更改', 'Unsaved generation settings')}</span>}
+      <Button variant={hasWiki && isDirty ? 'primary' : 'outline'} disabled={busy || savingSwitch !== null || !isDirty} onClick={() => onSave(mergedSettings, false)}>{u('保存设置', 'Save settings')}</Button>
+      {!running && (hasWiki
+        ? <Button variant="outline" disabled={busy || savingSwitch !== null || !config.canGenerate || !models || !!settings.model && !selected} onClick={() => setConfirmRegen(true)}>{u('全量重新生成', 'Regenerate all')}</Button>
+        : <Button variant="primary" disabled={busy || savingSwitch !== null || !config.canGenerate || !models || !!settings.model && !selected} onClick={() => onSave(mergedSettings, true)}>{u('开始生成', 'Generate')}</Button>)}
+    </div>
+    <Modal
+      open={confirmRegen}
+      onClose={() => setConfirmRegen(false)}
+      tone="warning"
+      title={u('确认全量重新生成？', 'Regenerate entire Wiki?')}
+      closeLabel={u('关闭确认框', 'Close confirmation')}
+      description={u('将基于当前设置从头重新扫描仓库并覆盖现有版本；若仅需同步近期代码变更，建议取消并点击上方「增量更新」。', 'This rebuilds the entire Wiki from scratch using current settings and replaces the published version. Use Incremental update above to only sync recent changes.')}
+      className="drw-confirm-dialog"
+      footer={
+        <div className="drw-confirm-actions">
+          <Button variant="outline" data-modal-autofocus onClick={() => setConfirmRegen(false)}>{u('取消', 'Cancel')}</Button>
+          <Button variant="primary" disabled={busy || savingSwitch !== null} onClick={() => { setConfirmRegen(false); onSave(mergedSettings, true) }}>{u('确认重新生成', 'Regenerate')}</Button>
+        </div>
+      }
+    />
   </section>
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KiB', 'MiB', 'GiB'] as const
+  let value = bytes
+  let idx = 0
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024
+    idx += 1
+  }
+  return idx === 0 ? `${Math.round(value)} B` : `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[idx]}`
 }
 
 function StoragePanel({ remote, u }: { remote: RepoWikiRemote; u: (zh: string, en: string) => string }) {
@@ -118,11 +328,15 @@ function StoragePanel({ remote, u }: { remote: RepoWikiRemote; u: (zh: string, e
   const prune = () => {
     if (!plan?.candidates.length || working) return
     setWorking(true); setNotice('')
-    void call(remote.pruneStorage({ keepJobs: 100, keepRevisions: 3, olderThanDays: 30 }, AbortSignal.timeout(30000))).then(result => { setPlan(result); setNotice(u(`已清理 ${plan.candidates.length} 项旧任务/版本。`, `Removed ${plan.candidates.length} old job/revision directories.`)) }).catch(error => setNotice(message(error))).finally(() => setWorking(false))
+    void call(remote.pruneStorage({ keepJobs: 20, keepRevisions: 3, olderThanDays: 30 }, AbortSignal.timeout(30000))).then(result => {
+      const removed = result.candidates.length
+      setPlan({ ...result, candidates: [], jobs: 0, revisions: 0, bytes: 0 })
+      setNotice(u(`已清理 ${removed} 项旧任务/版本。`, `Removed ${removed} old job/revision directories.`))
+    }).catch(error => setNotice(message(error))).finally(() => setWorking(false))
   }
   return <div className="drw-settings drw-storage">
-    <div className="drw-setting"><span>{u('本地数据', 'Local data')}<small>{u('检查旧任务和非当前 Wiki 版本；默认保留最近任务/版本，确认后才删除。', 'Checks old jobs and non-current Wiki revisions; keeps recent ones and deletes only after confirmation.')}</small></span><div className="drw-actions"><Button variant="outline" size="sm" disabled={working} onClick={scan}>{u('检查可清理数据', 'Check cleanup')}</Button>{!!plan?.candidates.length && <Button variant="outline" size="sm" disabled={working} onClick={prune}>{u('清理', 'Clean up')}</Button>}</div></div>
-    {plan && <p className="drw-muted">{u('可清理', 'Cleanable')}：{plan.jobs} {u('个旧任务', 'jobs')} · {plan.revisions} {u('个旧版本', 'revisions')} · {plan.bytes} {u('字节', 'bytes')}</p>}
+    <div className="drw-setting"><span>{u('本地数据', 'Local data')}</span><div className="drw-actions"><Button variant="outline" size="sm" disabled={working} onClick={scan}>{u('检查可清理数据', 'Check cleanup')}</Button>{!!plan?.candidates.length && <Button variant="outline" size="sm" disabled={working} onClick={prune}>{u('清理', 'Clean up')}</Button>}</div></div>
+    {plan && <p className="drw-muted">{u('可清理', 'Cleanable')}：{plan.jobs} {u('个旧任务', 'jobs')} · {plan.revisions} {u('个旧版本', 'revisions')} · {formatBytes(plan.bytes)}</p>}
     {notice && <p className="drw-notice">{notice}</p>}
   </div>
 }
@@ -147,7 +361,7 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
   const wikiTarget = draftMode && task?.jobId ? `draft:${task.jobId}` : `published:${publishedWikiId ?? ''}`
   // A version switch must not route the previous manifest to the new RPC.
   const wiki = loadedWiki?.target === wikiTarget ? loadedWiki.wiki : null
-  const [route, setRoute] = useState<ReadingRoute>(() => { try { const v = sessionStorage.getItem(`${positionKey}:route`); return v === 'user' || v === 'developer' || v === 'maintainer' ? v : 'all' } catch { return 'all' } })
+  const [route] = useState<ReadingRoute>(() => { try { const v = sessionStorage.getItem(`${positionKey}:route`); return v === 'user' || v === 'developer' || v === 'maintainer' ? v : 'all' } catch { return 'all' } })
   const [directoryHidden, setDirectoryHidden] = useState(() => { try { return sessionStorage.getItem(`${positionKey}:directory`) === 'hidden' } catch { return false } })
   const sourceRequest = useRef(0)
   const sourceAbort = useRef<AbortController | null>(null)
@@ -161,6 +375,7 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
   const [query, setQuery] = useState('')
   const [matches, setMatches] = useState<{ id: string; snippet: string }[] | null>(null)
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const initializedCollapse = useRef('')
   const [source, setSource] = useState<SourceExcerpt | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -208,6 +423,27 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
   const citationOrigin = useRef<HTMLElement | null>(null)
   const labels = useMemo(() => ({ code: { copyLabel: u('复制', 'Copy'), copiedLabel: u('已复制', 'Copied') }, footnotes: u('注释', 'Footnotes') }), [u('复制', 'Copy')])
   const act = async (operation: () => Promise<void>) => { setBusy(true); setError(''); setNotice(''); try { await operation() } catch (e) { setError(message(e)) } finally { setBusy(false) } }
+  const switchQueue = useRef(Promise.resolve())
+  const configRef = useRef(config)
+  configRef.current = config
+  const toggleSwitch = (key: AutoSaveSwitchKey, value: boolean): Promise<void> => {
+    const operation = switchQueue.current.catch(() => {}).then(async () => {
+      const base = configRef.current
+      if (!base) return
+      setError('')
+      setNotice('')
+      try {
+        const updated = await call(remote.saveProjectConfig({ path: project.path, settings: { ...base.settings, [key]: value } }))
+        configRef.current = updated
+        setConfig(updated)
+      } catch (e) {
+        setError(message(e))
+        throw e
+      }
+    })
+    switchQueue.current = operation
+    return operation
+  }
   useEffect(() => {
     const controller = new AbortController()
     void call(remote.getProjectConfig({ path: project.path }, controller.signal))
@@ -222,7 +458,20 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
     const controller = new AbortController()
     const request = draftMode && task?.jobId ? remote.readDraft({ jobId: task.jobId }, controller.signal) : remote.readWiki({ wikiId: wikiId! }, controller.signal)
     void call<{ wiki: WikiManifest | null }>(request).then(({ wiki: w }) => {
-      if (!controller.signal.aborted) { setLoadedWiki({ target: wikiTarget, wiki: w }); if (w) setPageId(p => w.pages.some(entry => entry.id === p && entry.kind !== 'group' && entry.bytes > 0) ? p : w.pages.find(entry => entry.kind !== 'group' && entry.bytes > 0)?.id ?? '') }
+      if (!controller.signal.aborted) {
+        setLoadedWiki({ target: wikiTarget, wiki: w })
+        if (w) {
+          setPageId(p => w.pages.some(entry => entry.id === p && entry.kind !== 'group' && entry.bytes > 0) ? p : w.pages.find(entry => entry.kind !== 'group' && entry.bytes > 0)?.id ?? '')
+          const collapseKey = `${wikiTarget}:${w.revision ?? ''}`
+          if (initializedCollapse.current !== collapseKey) {
+            initializedCollapse.current = collapseKey
+            if (w.pages.length > 18) {
+              const hasChild = new Set(w.pages.map(entry => entry.parentId).filter((id): id is string => !!id))
+              setCollapsed(new Set(w.pages.filter(entry => entry.parentId && hasChild.has(entry.id)).map(entry => entry.id)))
+            } else setCollapsed(new Set())
+          }
+        }
+      }
     }).catch(e => { if (!controller.signal.aborted) setError(message(e)) })
     return () => controller.abort()
   }, [remote, wikiTarget, project.wiki?.updatedAt, task?.finishedAt, draftMode ? `${task?.outlineVersion ?? 0}:${task?.pagesDone ?? 0}:${task?.checkpointAt ?? ''}` : null])
@@ -294,60 +543,149 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
   if (matches && wiki) for (const match of matches) {
     let current = treePages.find(p => p.id === match.id); const seen = new Set<string>()
     while (current?.parentId && !seen.has(current.id)) { seen.add(current.id); visible.add(current.parentId); current = treePages.find(p => p.id === current?.parentId) }
+    if (current?.kind === 'group') {
+      const queue = [current.id]
+      while (queue.length) { const parent = queue.pop()!; for (const child of treePages.filter(p => p.parentId === parent)) if (!visible.has(child.id)) { visible.add(child.id); queue.push(child.id) } }
+    }
   }
-  const fold = (id: string) => setCollapsed(old => { const next = new Set(old); next.has(id) ? next.delete(id) : next.add(id); return next })
+  const childrenOf = (parent: string) => treePages.filter(p => p.parentId === parent)
+  const activePath = new Set<string>()
+  let activeWalker = page
+  const activeSeen = new Set<string>()
+  while (activeWalker?.parentId && !activeSeen.has(activeWalker.id)) { activeSeen.add(activeWalker.id); activePath.add(activeWalker.parentId); activeWalker = treePages.find(p => p.id === activeWalker?.parentId) }
+  const menuItems = (() => {
+    const items: BranchedMenuItem[] = []
+    const collect = (parent: WikiPageMeta, depth: number, kids: BranchedMenuChild[], seen: Set<string>) => {
+      for (const child of childrenOf(parent.id)) {
+        if (seen.has(child.id)) continue
+        seen.add(child.id)
+        if (matches && !visible.has(child.id)) continue
+        const group = child.kind === 'group'
+        if (!group) {
+          const item = task?.items?.find(entry => entry.id === child.id)
+          const savedState = item?.bodyState ?? (child.bytes ? 'complete' : item?.state ?? 'pending')
+          const state = savedState === 'writing' && !task?.running ? 'pending' : savedState
+          const pending = !child.bytes
+          const status = state === 'writing' ? u('生成中', 'Writing') : state === 'failed' ? u('失败', 'Failed') : u('待生成', 'Pending')
+          const hasChildren = childrenOf(child.id).length > 0
+          const expanded = !collapsed.has(child.id) || !!matches || activePath.has(child.id)
+          const nodeState: BranchedMenuState = pending ? (state === 'writing' ? 'writing' : state === 'failed' ? 'failed' : 'pending') : 'ready'
+          kids.push({
+            value: child.id,
+            label: child.title,
+            title: pending ? `${child.title} · ${status}` : child.title,
+            depth,
+            state: nodeState,
+            disabled: pending,
+            badge: draftMode && pending ? <small className={`${state === 'failed' ? 'drw-node-warning' : ''}${state === 'writing' ? ' drw-node-loading' : ''}`} aria-hidden="true">{state === 'writing' ? <WikiIcon name="writing" size={12} /> : state === 'failed' ? <WikiIcon name="failed" size={12} /> : null}</small> : null,
+            ...(hasChildren && !matches ? { expanded, toggleLabel: `${expanded ? u('折叠', 'Collapse') : u('展开', 'Expand')} ${child.title}`, onToggle: () => setCollapsed(previous => { const next = new Set(previous); next.has(child.id) ? next.delete(child.id) : next.add(child.id); return next }) } : {})
+          })
+        }
+        if (!collapsed.has(child.id) || matches || activePath.has(child.id)) collect(child, depth + (group ? 0 : 1), kids, seen)
+      }
+    }
+    for (const node of treePages.filter(p => (p.parentId ?? null) === null).filter(p => !matches || visible.has(p.id))) {
+      const kids: BranchedMenuChild[] = []
+      collect(node, 1, kids, new Set([node.id]))
+      const group = node.kind === 'group'
+      if (group && !kids.length) continue
+      const item = task?.items?.find(entry => entry.id === node.id)
+      const savedState = item?.bodyState ?? (node.bytes ? 'complete' : item?.state ?? 'pending')
+      const state = savedState === 'writing' && !task?.running ? 'pending' : savedState
+      const pending = !group && !node.bytes
+      const status = state === 'writing' ? u('生成中', 'Writing') : state === 'failed' ? u('失败', 'Failed') : u('待生成', 'Pending')
+      const nodeState: BranchedMenuState = group
+        ? (kids.some(kid => !kid.disabled) ? 'ready' : 'pending')
+        : (pending ? (state === 'writing' ? 'writing' : state === 'failed' ? 'failed' : 'pending') : 'ready')
+      const common = { id: node.id, label: node.title, title: pending ? `${node.title} · ${status}` : node.title, state: nodeState, disabled: pending, collapsible: !matches, badge: draftMode && pending ? <small className={`${state === 'failed' ? 'drw-node-warning' : ''}${state === 'writing' ? ' drw-node-loading' : ''}`} aria-hidden="true">{state === 'writing' ? <WikiIcon name="writing" size={12} /> : state === 'failed' ? <WikiIcon name="failed" size={12} /> : null}</small> : null }
+      if (kids.length) items.push({ ...common, ...(group ? {} : { value: node.id }), children: kids })
+      else if (!group) items.push({ ...common, value: node.id })
+    }
+    return items
+  })()
+  const openSections = menuItems.reduce<number[]>((list, item, index) => {
+    if (!item.children?.length) return list
+    if (!matches && item.id && collapsed.has(item.id) && !activePath.has(item.id)) return list
+    list.push(index)
+    return list
+  }, [])
   const readable = wiki?.pages.filter(p => p.kind !== 'group' && p.bytes > 0) ?? []
   const routeList = routePages(wiki?.pages ?? [], wiki?.readingPaths, route)
   const breadcrumb: WikiPageMeta[] = []
   let ancestor = page
   const ancestors = new Set<string>()
   while (ancestor && !ancestors.has(ancestor.id)) { breadcrumb.unshift(ancestor); ancestors.add(ancestor.id); ancestor = wiki?.pages.find(p => p.id === ancestor?.parentId) }
-  const tree = (parent: string | null, depth = 0): ReactElement[] => depth > (treePages.length || 0) ? [] : treePages.filter(p => (p.parentId ?? null) === parent).filter(p => !matches || visible.has(p.id)).map(p => {
-    const children = treePages.some(c => c.parentId === p.id), group = p.kind === 'group', ready = !group && p.bytes > 0
-    const item = task?.items?.find(i => i.id === p.id), savedState = item?.bodyState ?? (p.bytes ? 'complete' : item?.state ?? 'pending')
-    const state = savedState === 'writing' && !task?.running ? 'pending' : savedState
-    const statusLabel = state === 'writing' ? u('生成中', 'Writing') : state === 'failed' ? u('失败', 'Failed') : u('待生成', 'Pending')
-    return <div key={p.id}><div className={`drw-directory-row ${mode === 'read' && p.id === pageId ? 'active' : ''} ${!group && !ready ? 'pending' : ''}`} style={{ paddingLeft: 6 + depth * 18 }}>
-      {Array.from({ length: depth }, (_, i) => <span key={i} className="drw-tree-guide" style={{ left: 13 + i * 18 }} aria-hidden="true" />)}
-      {children ? <button type="button" className="drw-fold" aria-label={`${collapsed.has(p.id) && !matches ? u('展开', 'Expand') : u('折叠', 'Collapse')} ${p.title}`} aria-expanded={!collapsed.has(p.id) || !!matches} onClick={() => fold(p.id)}><WikiIcon name={collapsed.has(p.id) && !matches ? 'chevron-right' : 'chevron-down'} /></button> : <span className="drw-fold" />}
-      <button type="button" className="drw-directory-link" title={p.title} disabled={!group && !ready} aria-label={!group && !ready ? `${p.title} · ${statusLabel}` : p.title} onClick={() => { if (group) fold(p.id); else { navigatePage(p.id) } }}>{p.title}</button>
-      {draftMode && !group && !ready && <small className={`${state === 'failed' ? 'drw-node-warning' : ''}${state === 'writing' ? ' drw-node-loading' : ''}`} aria-hidden="true">{state === 'writing' ? <WikiIcon name="writing" size={12} /> : state === 'failed' ? <WikiIcon name="failed" size={12} /> : null}</small>}
-    </div>{children && (!collapsed.has(p.id) || matches) && tree(p.id, depth + 1)}</div>
-  })
   return <>
     <div className="drw-project-header"><header className="drw-panelhead"><div className="drw-panelhead-info"><Button variant="ghost" size="sm" aria-label={u('返回项目列表', 'Projects')} title={u('返回项目列表', 'Projects')} onClick={onBack}><WikiIcon name="arrow-left" /></Button><div title={project.path}><strong>{project.name}</strong></div></div><div className="drw-panelhead-actions"><Button variant="ghost" size="sm" className="drw-iconbtn" aria-label={u('生成配置', 'Generation settings')} title={u('生成配置', 'Generation settings')} onClick={() => setMode('manage')}><WikiIcon name="settings" /></Button></div></header>
-    <div className="drw-project-tabs"><SegmentedControl id="drw-project-views" value={mode} onChange={v => setMode(v as typeof mode)} label={u('项目视图', 'Project view')} options={[{ value: 'read', label: 'Wiki' }, { value: 'cards', label: u('知识卡片', 'Cards') }, { value: 'manage', label: u('管理', 'Manage') }]} />{mode !== 'manage' && task?.jobId && <label className="drw-version-label"><span>{draftMode ? u('草稿', 'Draft') : u('已发布', 'Published')}</span><Switch label={u('查看本次草稿', 'View current draft')} checked={draftMode} disabled={!project.wiki && !task?.result} onChange={value => { setReaderTab('document'); setSource(null); setDraftMode(value) }} /></label>}</div>
+    <div className="drw-project-tabs"><SegmentedControl id="drw-project-views" value={mode} onChange={v => setMode(v as typeof mode)} label={u('项目视图', 'Project view')} options={[{ value: 'read', label: 'Wiki' }, { value: 'cards', label: u('知识卡片', 'Cards') }, { value: 'manage', label: u('管理', 'Manage') }]} /></div>
     </div><div className="drw-workspace">
       <aside className="drw-directory" hidden={directoryHidden || mode === 'manage'}><Input type="search" aria-label={u('搜索 Wiki 页面', 'Search Wiki pages')} placeholder={u('搜索文档', 'Search documents')} value={query} onChange={e => setQuery(e.target.value)} disabled={!wiki} />
-        <button type="button" className={`drw-tasklink ${mode === 'manage' ? 'active' : ''}`} onClick={() => setMode('manage')}><span className="drw-tasklink-label"><WikiIcon name="wiki" />{u('概览', 'Overview')}</span><small>{task ? <Stage status={task} /> : wiki ? u('已生成', 'Generated') : ''}</small></button>
-        <nav aria-label={t('contents')}>{wiki ? tree(null) : <div className="drw-directory-empty"><span className="drw-empty-mark"><WikiIcon name="wiki" size={48} /></span><p>{task?.running ? u('正在分析仓库 / 规划目录', 'Analyzing / planning outline') : u('尚未生成 Repo Wiki', 'No Repo Wiki yet')}</p></div>}{matches?.length === 0 && <p className="drw-muted">{u('没有匹配的页面', 'No matching pages')}</p>}</nav>
+        <button type="button" className={`drw-tasklink ${mode === 'manage' ? 'active' : ''}`} onClick={() => setMode('manage')}><span className="drw-tasklink-label"><WikiIcon name="wiki" />{u('任务与设置', 'Tasks & Settings')}</span><small>{task ? <Stage status={task} /> : wiki ? u('已生成', 'Generated') : ''}</small></button>
+        <div className="drw-bm-scroll">
+          {wiki ? <BranchedMenu items={menuItems} open={openSections} active={mode === 'read' ? pageId : ''} onSelect={value => navigatePage(value)} onToggle={(index, nextOpen) => { const id = menuItems[index]?.id; if (!id) return; setCollapsed(previous => { const next = new Set(previous); if (nextOpen) next.delete(id); else next.add(id); return next }) }} labels={{ expand: u('展开', 'Expand'), collapse: u('折叠', 'Collapse') }} ariaLabel={t('contents')} /> : <div className="drw-directory-empty"><span className="drw-empty-mark"><WikiIcon name="wiki" size={48} /></span><p>{task?.running ? u('正在分析仓库 / 规划目录', 'Analyzing / planning outline') : u('尚未生成 Repo Wiki', 'No Repo Wiki yet')}</p></div>}
+          {matches?.length === 0 && <p className="drw-muted">{u('没有匹配的页面', 'No matching pages')}</p>}
+        </div>
 
       </aside>
       <section className="drw-reader-column">
         <div className="drw-reader-toolbar" hidden={mode === 'manage'}>
           <Button variant="ghost" size="sm" title={directoryHidden ? u('显示目录', 'Show contents') : u('收起目录', 'Hide contents')} aria-label={directoryHidden ? u('显示目录', 'Show contents') : u('收起目录', 'Hide contents')} onClick={() => setDirectoryHidden(value => { try { sessionStorage.setItem(`${positionKey}:directory`, value ? 'shown' : 'hidden') } catch {} return !value })}><WikiIcon name="list" /></Button>
           {mode === 'read' && <SegmentedControl id="drw-reader-tabs" value={readerTab} onChange={setReaderTab} label={u('阅读方式', 'Reader view')} options={[{ value: 'document', label: u('文档', 'Document') }, { value: 'markdown', label: 'Markdown' }, { value: 'sources', label: u('来源', 'Sources') }]} />}
-          {mode === 'read' && wiki && (wiki.readingPaths || !draftMode) && <details className="drw-reader-more"><summary>{u('更多', 'More')}</summary><div>
-            {wiki.readingPaths && <SegmentedControl id="drw-routes" label={u('阅读路线', 'Reading path')} value={route} onChange={value => { setRoute(value as ReadingRoute); try { sessionStorage.setItem(`${positionKey}:route`, value) } catch {} }} options={[{value:'all',label:u('全部目录','All pages')},{value:'user',label:u('使用项目','Use')},{value:'developer',label:u('接手开发','Develop')},{value:'maintainer',label:u('深入维护','Maintain')}]} />}
-            {!draftMode && <><Button variant="ghost" size="sm" disabled={busy} onClick={() => { void act(() => downloadWiki(remote, wiki)) }}>{u('下载 Markdown', 'Download Markdown')}</Button><Button variant="ghost" size="sm" disabled={busy} onClick={() => { void act(async () => { const r = await call(remote.exportWiki({ wikiId: wiki.id })); setNotice(`${u('已导出到', 'Exported to')} ${r.directory}`) }) }}>{u('导出到项目', 'Export to project')}</Button></>}
-          </div></details>}
         </div>
       <main className={`drw-main ${mode === 'read' ? 'drw-main-reading' : ''}`} ref={main} onScroll={e => { if (!scrollPosition.current.ready) return; scrollPosition.current.top = e.currentTarget.scrollTop; try { sessionStorage.setItem(scrollKey, String(e.currentTarget.scrollTop)) } catch { /* Optional storage. */ } }}>
         {error && <div className="drw-alert" role="alert">{error}</div>}{notice && <div className="drw-notice" role="status">{notice}</div>}
         {mode === 'manage' && <div className="drw-management drw-management-simple">
           <section className="drw-management-task" aria-label={u('生成任务', 'Generation')}>
-        {task ? <><Progress status={task} modelLabel={models?.models.find(m => m.provider === task.model?.provider && m.model === task.model?.model)?.label} busy={busy} onPause={() => { void act(async () => { await call(remote.pauseJob({ jobId: task.jobId! })); await refreshJobs() }) }} onResume={() => { void act(async () => { await call(remote.resumeJob({ jobId: task.jobId! })); setDraftMode(true); await refreshJobs() }) }} onCancel={() => { void act(async () => { await call(remote.cancelJob({ jobId: task.jobId! })); await refreshJobs() }) }} /><div className="drw-actions drw-progress-actions">{!!readable.length && <Button variant="primary" onClick={() => setMode('read')}>{draftMode ? u('阅读已完成草稿', 'Read completed drafts') : u('阅读 Wiki', 'Read Wiki')}</Button>}{!task.running && config?.git.available && project.wiki && <Button variant="outline" disabled={busy} onClick={() => { void act(async () => { await call(remote.startGeneration({ path: project.path, mode: 'update' })); await refreshJobs(); await reload() }) }}>{u('重试增量更新', 'Retry incremental update')}</Button>}</div></> : <p>{u('暂无生成任务。', 'No generation task yet.')}</p>}
+        {(() => {
+          const taskModel = models?.models.find(m => m.provider === task?.model?.provider && m.model === task?.model?.model)
+          const taskModelLabel = taskModel?.name ?? taskModel?.label
+          const isDraftRead = draftMode && task?.stage !== 'done'
+          const canReadPublished = !isDraftRead && (readable.length > 0 || (project.wiki?.pages ?? 0) > 0)
+          const retryUpdate = shouldRetryIncrementalLabel(config, task)
+          const taskActions = (canReadPublished || (!task?.running && config?.git.available && project.wiki)) ? <>
+            {canReadPublished && <Button variant={!task?.running && task?.recoverable ? 'outline' : 'primary'} onClick={() => setMode('read')}>{u('阅读 Wiki', 'Read Wiki')}</Button>}
+            {!task?.running && config?.git.available && project.wiki && <Button variant="outline" disabled={busy} onClick={() => { void act(async () => { await call(remote.startGeneration({ path: project.path, mode: 'update' })); await refreshJobs(); await reload() }) }}>{retryUpdate ? u('重试增量更新', 'Retry incremental update') : u('增量更新', 'Incremental update')}</Button>}
+          </> : null
+          if (task) {
+            return <Progress status={task} modelLabel={taskModelLabel} busy={busy} actions={taskActions} onPause={() => { void act(async () => { await call(remote.pauseJob({ jobId: task.jobId! })); await refreshJobs() }) }} onResume={() => { void act(async () => { await call(remote.resumeJob({ jobId: task.jobId! })); setDraftMode(true); await refreshJobs() }) }} onCancel={() => { void act(async () => { await call(remote.cancelJob({ jobId: task.jobId! })); await refreshJobs() }) }} />
+          }
+          if (project.wiki) {
+            return <section className="drw-progress drw-task-summary">
+              <div className="drw-task-header">
+                <div className="drw-task-header-main">
+                  <span className="drw-section-label">{u('当前任务', 'Current task')}</span>
+                  <div className="drw-task-headline">
+                    <StatusMark status="done" size={22} strokeWidth={2} strike={false} labels={{ done: u('已生成', 'Generated') }} />
+                    <h2><span className="drw-jobstage drw-job-done">{u('已生成', 'Generated')}</span></h2>
+                  </div>
+                </div>
+                {taskActions && <div className="drw-actions drw-task-actions">{taskActions}</div>}
+              </div>
+              <p className="drw-muted drw-task-count">
+                {project.wiki.pages} {u('页已生成', 'pages')}{!!project.wiki.cards && ` · ${project.wiki.cards} ${u('张知识卡片', 'cards')}`}
+                {project.wiki.updatedAt && ` · ${u('更新于', 'Updated')} ${new Date(project.wiki.updatedAt).toLocaleString()}`}
+              </p>
+            </section>
+          }
+          return <section className="drw-progress drw-task-summary">
+            <span className="drw-section-label">{u('当前任务', 'Current task')}</span>
+            <div className="drw-task-headline">
+              <StatusMark status="pending" size={22} strokeWidth={2} strike={false} labels={{ pending: u('尚未生成', 'Not generated') }} />
+              <h2><span className="drw-jobstage">{u('尚未生成', 'Not generated')}</span></h2>
+            </div>
+            <p className="drw-muted drw-task-count">{u('请在下方确认生成设置并点击「开始生成」。', 'Review generation settings below and click Generate.')}</p>
+          </section>
+        })()}
           </section>
           <section className="drw-management-settings">
-        {config ? <Configuration config={config} models={models} busy={busy} running={!!task?.running} project={project} wiki={wiki} task={task} remote={remote} onStart={() => setMode('manage')} onReloadModels={() => { void act(async () => { setModels(await call(remote.getModelCapabilities(AbortSignal.timeout(20000)))) }) }} onSave={(settings, start) => { void act(async () => {
-          const c = await call(remote.saveProjectConfig({ path: project.path, settings })); setConfig(c)
+        {config ? <Configuration config={config} models={models} busy={busy} running={!!task?.running} project={project} wiki={wiki} remote={remote} onToggleSwitch={toggleSwitch} onReloadModels={() => { void act(async () => { setModels(await call(remote.getModelCapabilities(AbortSignal.timeout(20000)))) }) }} onSave={(settings, start) => { void act(async () => {
+          const latest = configRef.current?.settings
+          const merged = latest ? { ...settings, autoUpdate: latest.autoUpdate, autoExport: latest.autoExport, agentReference: latest.agentReference } : settings
+          const c = await call(remote.saveProjectConfig({ path: project.path, settings: merged })); configRef.current = c; setConfig(c)
           if (start) { await call(remote.startGeneration({ path: project.path })); await refreshJobs(); setMode('manage') }
           else setNotice(u('配置已保存。', 'Settings saved.'))
         }) }} /> : <p className="drw-muted">{u('正在读取配置和模型…', 'Loading settings and models…')}</p>}
           </section>
-          <details className="drw-management-section"><summary>{u('引用记录', 'Reference history')}</summary>
-            {config && <References remote={remote} config={config} u={u} onConfig={setConfig} historyOnly />}
-          </details>
         </div>}
         {mode === 'cards' && wiki && <Knowledge wiki={wiki} draft={draftMode} u={u} onSource={openSource} />}
         {(mode === 'read' || mode === 'cards') && !wiki && <p className="drw-muted">{u('尚未生成内容，请在生成配置中开始。', 'No content yet. Start from settings.')}</p>}
@@ -364,9 +702,8 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
             const reviewing = task?.running && item?.step === 'verify' && task.currentAction === `核验 ${page?.title}`
             const label = writing ? (task.currentAction?.startsWith('修订 ') ? u('修订中', 'Revising') : u('生成中', 'Writing'))
               : reviewing ? u('核验中', 'Reviewing')
-              : item?.verificationState === 'supported' ? u('核验通过', 'Reviewed')
-              : item?.verificationState === 'uncertain' ? u('待修订', 'Needs revision') : u('待核验', 'Awaiting review')
-            return <small className="drw-muted" role="status">{label}</small>
+              : item?.verificationState === 'uncertain' ? u('待修订', 'Needs revision') : ''
+            return label ? <small className="drw-muted" role="status">{label}</small> : null
           })()}
 
           {readerTab === 'document' && !!references.length && <details className="drw-reference-files"><summary>{u('参考文件', 'Referenced files')} ({references.length})</summary><div>{references.map(source => <Button key={source.path} variant="ghost" size="sm" title={source.path} onClick={event => { citationOrigin.current = event.currentTarget; void openSource(source.id, source.startLine) }}>{sourceLabel(source.path, sourcePaths)}</Button>)}</div></details>}
@@ -385,6 +722,14 @@ function Detail({ remote, project, task, onBack, reload }: { remote: RepoWikiRem
             </section>
             <details key={source?.id ?? 'all-sources'} open={!source && !sourceLoading} className="drw-sources"><summary>{u('本页来源', 'Page sources')} ({page?.sources?.length ?? 0})</summary><div className="drw-actions">{page?.sources?.map(s => <Button key={s.id} variant="outline" size="sm" onClick={() => { void openSource(s.id, s.startLine) }}>{s.path}:{s.startLine}–{s.endLine}</Button>)}</div></details>
           </>}
+          {readerTab === 'document' && (() => {
+            const childPages = wiki.pages.filter(entry => entry.parentId === page?.id && entry.kind !== 'group')
+            if (!childPages.length) return null
+            return <section className="drw-child-pages" aria-label={u('下属页面', 'Child pages')}>
+              <h2>{u('本分类页面', 'In this section')}</h2>
+              <div className="drw-child-grid">{childPages.map(child => <button key={child.id} type="button" className="drw-child-card" disabled={!child.bytes} onClick={() => navigatePage(child.id)}><strong>{child.title}</strong>{child.summary && <span>{child.summary}</span>}</button>)}</div>
+            </section>
+          })()}
           {!!page?.relatedPageIds?.length && <nav className="drw-related-pages" aria-label={u('继续阅读', 'Related pages')}>{page.relatedPageIds.map(id => { const related = wiki.pages.find(p => p.id === id && p.kind !== 'group'); return related ? <Button key={id} variant="ghost" disabled={!related.bytes} onClick={() => navigatePage(id)}>{related.title}</Button> : <small key={id}>{u('关联页面不存在', 'Related page is unavailable')}</small> })}</nav>}
           <div className="drw-pager">{[-1, 1].map(delta => { const adjacent = (route === 'all' || !wiki.readingPaths ? readable : routeList)[(route === 'all' || !wiki.readingPaths ? readable : routeList).findIndex(p => p.id === pageId) + delta]; return <Button key={delta} variant="ghost" disabled={!adjacent} onClick={() => adjacent && navigatePage(adjacent.id)}>{delta < 0 && <WikiIcon name="arrow-left" />}{adjacent?.title ?? (delta < 0 ? t('prev') : t('next'))}{delta > 0 && <WikiIcon name="arrow-right" />}</Button> })}</div>
           </div>
@@ -420,12 +765,4 @@ export function RepoWikiPage({ ctx }: { ctx: PanelContext }): ReactElement {
     {current ? <Detail key={current.path} remote={remote} project={current} task={jobState.jobs.find(j => j.repoPath === current.path)} onBack={() => { open(''); void reload() }} reload={reload} />
       : <div className="drw-page">{loading ? <p>{u('正在读取项目…', 'Loading projects…')}</p> : <ListPage projects={entries} filter={filter} viewMode={viewMode} busy={null} onFilter={setFilter} onViewMode={setViewMode} onOpen={i => { if (entries[i]) open(entries[i]!.path) }} onGenerate={i => { if (entries[i]) open(entries[i]!.path) }} />}</div>}
   </div>
-}
-
-async function downloadWiki(remote: RepoWikiRemote, wiki: WikiManifest): Promise<void> {
-  const parts = [`# ${wiki.title}`, '', wiki.description, '']
-  for (const page of wiki.pages.filter(p => p.kind !== 'group')) parts.push('---', '', (await call(remote.readPage({ wikiId: wiki.id, pageId: page.id, revision: wiki.revision }))).page.content, '')
-  const url = URL.createObjectURL(new Blob([parts.join('\n')], { type: 'text/markdown;charset=utf-8' }))
-  const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${wiki.id}.md`; anchor.click()
-  window.setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }

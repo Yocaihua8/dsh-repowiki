@@ -1,7 +1,11 @@
 import { mkdir, readdir, readFile, copyFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { gzipSync, gunzipSync } from 'node:zlib'
+import { gzip, gunzip } from 'node:zlib'
+import { promisify } from 'node:util'
+
+const gzipAsync = promisify(gzip)
+const gunzipAsync = promisify(gunzip)
 import type { GenerationStatus, KnowledgeCard, ModelSelection, PageReviewMeta, ProjectSettings, SourceExcerpt, CardEvidence } from '../shared/types.js'
 import type { WikiOutline } from './prompts.js'
 import type { RepositorySnapshot } from './snapshot.js'
@@ -134,7 +138,7 @@ export class CheckpointStore {
   async saveSnapshot(id: string, snapshot: RepositorySnapshot): Promise<void> {
     const target = this.path(id, 'snapshot.json.gz')
     await mkdir(join(this.directory, 'jobs', id), { recursive: true })
-    const body = gzipSync(Buffer.from(JSON.stringify(snapshot), 'utf8'), { level: 6 })
+    const body = await gzipAsync(Buffer.from(JSON.stringify(snapshot), 'utf8'), { level: 6 })
     const temporary = `${target}.${randomUUID()}.tmp`
     await writeFile(temporary, body)
     await rename(temporary, target)
@@ -142,7 +146,7 @@ export class CheckpointStore {
 
   async snapshot(id: string): Promise<RepositorySnapshot | undefined> {
     // 兼容旧任务的未压缩快照（snapshot.json）。
-    try { return JSON.parse(gunzipSync(await readFile(this.path(id, 'snapshot.json.gz'))).toString('utf8')) as RepositorySnapshot }
+    try { return JSON.parse((await gunzipAsync(await readFile(this.path(id, 'snapshot.json.gz')))).toString('utf8')) as RepositorySnapshot }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
     try { return JSON.parse(await readFile(this.path(id, 'snapshot.json'), 'utf8')) as RepositorySnapshot }
     catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw e }

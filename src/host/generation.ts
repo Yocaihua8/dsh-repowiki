@@ -82,7 +82,7 @@ export async function generate(job: Checkpoint, signal: AbortSignal, runtime: Ru
       && (previous.parentId ?? null) === (page.parentId ?? null) && !previous.sources.some(f => changed.has(f.path))
       && !page.relatedPaths.some(p => [...changed].some(f => f === p || f.startsWith(`${p}/`))) && !(page.id === 'overview' && changed.size)
     const gatePage = (candidate: WritePageInput): WritePageInput => {
-      const quality = evaluatePage(page, candidate.content, candidate.sources ?? [], snapshot!.files.map(file => file.path))
+      const quality = evaluatePage(page, candidate.content, candidate.sources ?? [], snapshot!.files.map(file => file.path), { userRoute: outline.readingPaths?.user.includes(page.id) ?? false })
       if (job.qualityPolicy === 'enforce' && quality.hard.length) throw new WikiError(`页面质量硬性失败：${page.id}：${quality.hard.join('；')}`, 'repowiki/page-quality')
       return { ...candidate, quality: compactQuality(quality) }
     }
@@ -132,7 +132,7 @@ export async function generate(job: Checkpoint, signal: AbortSignal, runtime: Ru
   const now = new Date().toISOString()
   const legacyPages: WritePageInput[] = outline.pages.map(p => p.kind === 'group' ? { ...p, content: '', related: [] } : job.pages.find(w => w.id === p.id)!)
   // 旧引擎同样在发布前注入确定性结构图，保持两种引擎的阅读形态一致。
-  await augmentPages(legacyPages, snapshot.files, job.settings.language, id => outline.pages.find(p => p.id === id)?.type)
+  await augmentPages(legacyPages, snapshot.files, job.settings.language, id => outline.pages.find(p => p.id === id)?.type, { skipIds: new Set(outline.readingPaths?.user ?? []) })
   const saved = await writeWiki(runtime.stateDir, { id: s.wikiId!, repoPath: s.repoPath!, title: outline.title, description: outline.description, readingPaths: outline.readingPaths,
     language: job.settings.language, createdAt: old?.createdAt ?? now, updatedAt: now, generator: 'dsh-repowiki', jobId: s.jobId,
     source: snapshot.source, sourceIndex, model: job.selection, cards: contentPages.map(p => job.cards.find(c => c.pageId === p.id)!) },

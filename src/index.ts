@@ -224,7 +224,7 @@ export default class RepoWiki extends TypertRemoteService {
         const settled = await Promise.allSettled(models.map(async model => {
           const info = await this.ctx.llm.resolveModelInfo(provider.id, model.id, signal)
           const display = modelDisplay(provider.name, model.name)
-          return { provider: provider.id, model: model.id, label: model.name, name: model.name, source: display.source, description: display.description,
+          return { provider: provider.id, model: model.id, label: model.name, name: display.name, source: display.source, description: display.description,
             effortOptions: info.reasoning?.efforts.map(e => ({ id: e.id, name: e.name })) ?? [],
             efforts: info.reasoning?.efforts.map(e => e.id) ?? [] }
         }))
@@ -232,7 +232,8 @@ export default class RepoWiki extends TypertRemoteService {
         settled.forEach((result, index) => {
           if (result.status === 'fulfilled') { response.models.push(result.value); return }
           const model = models[index]!
-          response.models.push({ provider: provider.id, model: model.id, label: model.name, name: model.name, source: provider.name, description: '', efforts: [], effortOptions: [] })
+          const display = modelDisplay(provider.name, model.name)
+          response.models.push({ provider: provider.id, model: model.id, label: model.name, name: display.name, source: display.source, description: display.description, efforts: [], effortOptions: [] })
           response.warnings.push(`${provider.name}/${model.id}：思考能力暂不可用。`)
         })
       } catch { signal.throwIfAborted(); response.warnings.push(`${provider.name}：模型列表暂不可用。`) }

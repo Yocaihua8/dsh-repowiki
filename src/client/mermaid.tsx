@@ -175,7 +175,11 @@ function MermaidDiagram({ code, raw, u }: { code: string; raw: string; u: Text }
 export function MermaidMarkdown({ text, labels, fileMentions }: { text: string; labels: MarkdownLabels; fileMentions?: MarkdownFileMentions | undefined }): ReactElement {
   const u = useText()
   const segments = useMemo(() => splitMermaidDiagrams(text), [text])
-  return <>{segments.map((segment, index) => segment.kind === 'markdown'
-    ? <MarkdownText key={`markdown:${index}`} text={segment.text} labels={labels} fileMentions={fileMentions} />
-    : <MermaidDiagram key={`mermaid:${index}`} code={segment.code} raw={segment.raw} u={u} />)}</>
+  const renderLeaf = (segment: { kind: 'markdown'; text: string } | { kind: 'mermaid'; code: string; raw: string }, key: string) =>
+    segment.kind === 'markdown'
+      ? <MarkdownText key={key} text={segment.text} labels={labels} fileMentions={fileMentions} />
+      : <MermaidDiagram key={key} code={segment.code} raw={segment.raw} u={u} />
+  return <>{segments.map((segment, index) => segment.kind === 'details'
+    ? <details key={`details:${index}`} className="drw-structure-details"><summary>{segment.summary}</summary>{segment.segments.map((child, childIndex) => renderLeaf(child, `details:${index}:${childIndex}`))}</details>
+    : renderLeaf(segment, `${segment.kind}:${index}`))}</>
 }

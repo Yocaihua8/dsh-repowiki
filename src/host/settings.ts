@@ -31,10 +31,11 @@ export function validateSettings(value: ProjectSettings): ProjectSettings {
   }
   if (value.collaboration !== undefined && !['single', 'collaborative'].includes(value.collaboration)) throw new WikiError('协作模式无效。', 'repowiki/settings')
   if (value.concurrency !== undefined && ![1, 2, 3].includes(value.concurrency)) throw new WikiError('并发设置无效。', 'repowiki/settings')
+  if (value.granularity !== undefined && !['standard', 'deep'].includes(value.granularity)) throw new WikiError('目录粒度设置无效。', 'repowiki/settings')
   if (value.roles !== undefined && (!value.roles || typeof value.roles !== 'object' || Array.isArray(value.roles))) throw new WikiError('角色模型设置无效。', 'repowiki/settings')
   const roles: RoleModels = { planner: normalizeModel(value.roles?.planner ?? null), writer: normalizeModel(value.roles?.writer ?? null), verifier: normalizeModel(value.roles?.verifier ?? null) }
   return { language: value.language, maxPages: value.maxPages, autoUpdate: value.autoUpdate, autoExport: value.autoExport,
-    agentReference: value.agentReference === true, collaboration: value.collaboration ?? 'collaborative', concurrency: value.concurrency ?? 2, roles,
+    agentReference: value.agentReference === true, collaboration: value.collaboration ?? 'collaborative', concurrency: value.concurrency ?? 2, granularity: value.granularity ?? 'standard', roles,
     model: normalizeModel(value.model), exclude: normalizeExclude(value.exclude) }
 }
 

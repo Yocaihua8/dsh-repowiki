@@ -6,14 +6,14 @@ import { MessageId, ReasoningEffortId, type UserMessage, type LlmFailure } from 
 import type { Agent, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Checkpoint, CheckpointStore } from './checkpoints.js'
 import { AgentWorkspace, digest } from './agent-workspace.js'
-import { captureSnapshot } from './snapshot.js'
+import { captureSnapshot, hasWorkingTreeChanged } from './snapshot.js'
 import type { RepositorySnapshot } from './snapshot.js'
 import type { SourceExcerpt, WikiManifest } from '../shared/types.js'
 import { readManifest, readPageContent, readSourceContent, writeWiki, type WritePageInput } from './store.js'
 import { gitState } from './git.js'
 import { WikiError } from './errors.js'
 import { restrictToScopedToolsNatively } from './tool-scope.js'
-import { coverageMatrix, formatCoverageMatrix, mermaidGuidance, readabilityGuidance, unifiedPlanningGuidance, type CoverageItem } from './prompts.js'
+import { coverageMatrix, formatCoverageMatrix, mermaidGuidance, plainLanguageGuidance, readabilityGuidance, unifiedPlanningGuidance, type CoverageItem } from './prompts.js'
 import { aggregateQuality, compactQuality, evaluatePage } from './quality.js'
 
 declare module '@deepseek-ai/dsh-llm' { interface MessageSourceMap { repowiki: { kind: 'repowiki' } } }
@@ -36,8 +36,42 @@ const ROUTER_RECOVERY_HINTS: Record<string, string> = {
   INVALID_TOOL_ARGUMENTS: 'Router 的工具参数校验未通过；请重新发起一轮或检查模型。',
 }
 
-function routerRecoveryHint(code: string | undefined): string {
+export function routerRecoveryHint(code: string | undefined): string {
   return code ? ROUTER_RECOVERY_HINTS[code] ?? '' : ''
+}
+
+/**
+ * 为原生 Agent / 协作子代理统一挂载瞬态请求错误（429 限流 / 5xx / 网络抖动）退避重试，
+ * 避免并发子代理因单次上游抖动直接消耗整轮 attempt。
+ */
+export function attachRequestRecovery(
+  scope: Parameters<AgentSetup>[0],
+  options: {
+    signal: AbortSignal
+    onWait?: (waiting: { reason: string; code: string; attempt: number; retryAt: string } | undefined) => Promise<void> | void
+    onRetryStart?: () => void
+    onErrorClear?: () => void
+    onTerminal?: (error: WikiError) => void
+  },
+): void {
+  let retries = 0, requestStep = ''
+  scope.on('agent/request-error', async ({ failure, turn, step, signal: turnSignal }) => {
+    options.onErrorClear?.()
+    const key = `${turn}:${step}`
+    if (key !== requestStep) { requestStep = key; retries = 0 }
+    const ms = recoveryDelay(failure, retries)
+    if (ms === null) {
+      const hint = routerRecoveryHint(failure.code)
+      options.onTerminal?.(new WikiError(`${failure.message}（${failure.code}）${hint ? `；${hint}` : ''}；已保存进度，请检查模型后继续。`, 'repowiki/paused'))
+      return undefined
+    }
+    retries++
+    await options.onWait?.({ reason: failure.message, code: failure.code ?? 'transient', attempt: retries, retryAt: new Date(Date.now() + ms).toISOString() })
+    try { await delay(ms, undefined, { signal: AbortSignal.any([options.signal, turnSignal]) }) } catch { return undefined }
+    await options.onWait?.(undefined)
+    options.onRetryStart?.()
+    return { kind: 'retry' }
+  })
 }
 
 function prompt(job: Checkpoint, coverage: readonly CoverageItem[] = [], fileCount = 0): string {
@@ -51,6 +85,7 @@ function prompt(job: Checkpoint, coverage: readonly CoverageItem[] = [], fileCou
     '目录提交后自主选择待完成主题，wiki_begin_page 标记当前页，按需要补读源码，用 wiki_save_page 保存 Markdown 和 sourceIds，保存即解锁阅读。引用格式 `path:L1-L9`；只要已被任意一次 wiki_read 读到即可，同一文件多段读取按并集计算。Host 会自动把覆盖引用的已读片段并入本页来源；未读取的范围会被拒绝并返回该文件已读范围，请先 wiki_read 补读。不要把所有文件完整复制进正文。',
     '有真实接口、配置项或错误处理时使用表格或围栏代码块。',
     mermaidGuidance,
+    plainLanguageGuidance,
     readabilityGuidance,
     unifiedPlanningGuidance,
     '按独立知识价值提炼 wiki_save_card，可跨文件、可多个卡片关联一页，也可某页没有卡片；不能机械一页一张。卡片给出正确的 sourceId/path/行号/连续原文 quote。',
@@ -63,7 +98,7 @@ function prompt(job: Checkpoint, coverage: readonly CoverageItem[] = [], fileCou
 
 export function nativeAgentRunner(ctx: Context, collaborative?: AgentRunner): AgentRunner {
   return async (job, signal, runtime) => {
-    if (job.settings.collaboration === 'collaborative' && job.mode === 'generate' && collaborative) return collaborative(job, signal, runtime)
+    if (job.settings.collaboration === 'collaborative' && collaborative) return collaborative(job, signal, runtime)
     const s = job.status
     s.stage = 'scan'; s.currentAction = '读取源码快照'; await runtime.save()
     if (job.mode === 'update' && !job.commit) job.commit = (await gitState(s.repoPath!)).commit ?? undefined
@@ -89,8 +124,7 @@ export function nativeAgentRunner(ctx: Context, collaborative?: AgentRunner): Ag
       // throttled so long tool loops do not re-read the repository before each step.
       if (fixed.source.kind === 'working' && Date.now() - lastWorkingCheck >= 10_000) {
         lastWorkingCheck = Date.now()
-        const current = await captureSnapshot(s.repoPath!, undefined, signal, true, job.settings.exclude)
-        if (current.source.fingerprint !== fixed.source.fingerprint) throw new WikiError('工作区源码已变化，已保留当前草稿；请恢复原版本后继续，或重新生成。', 'repowiki/paused')
+        if (await hasWorkingTreeChanged(fixed, job.settings.exclude, signal)) throw new WikiError('工作区源码已变化，已保留当前草稿；请恢复原版本后继续，或重新生成。', 'repowiki/paused')
       }
     }
     await assertVersion()
@@ -167,7 +201,7 @@ export function nativeAgentRunner(ctx: Context, collaborative?: AgentRunner): Ag
 function message(text: string): UserMessage { return { id: MessageId(randomUUID()), role: 'user', content: [{ type: 'text', text }], source: { kind: 'repowiki' } } }
 
 /** Export-only commits need no new model work; every saved excerpt is checked against the new snapshot. */
-async function reuseUnchanged(job: Checkpoint, snapshot: RepositorySnapshot, previous: WikiManifest, runtime: AgentGenerationRuntime, signal: AbortSignal): Promise<boolean> {
+export async function reuseUnchanged(job: Checkpoint, snapshot: RepositorySnapshot, previous: WikiManifest, runtime: AgentGenerationRuntime, signal: AbortSignal): Promise<boolean> {
   if (job.mode !== 'update' || previous.language !== job.settings.language || !previous.sourceIndex?.length
     || previous.sourceIndex.length !== snapshot.files.length
     || previous.sourceIndex.some(s => !snapshot.files.some(f => f.path === s.path && f.hash === s.hash))) return false

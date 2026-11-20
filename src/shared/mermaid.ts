@@ -21,10 +21,11 @@ export interface MermaidFence {
   raw: string
 }
 
-/** 文档切分后的片段：普通 Markdown 或一张 Mermaid 图。 */
+/** 文档切分后的片段：普通 Markdown、一张 Mermaid 图，或包含 Mermaid 图的折叠块。 */
 export type MermaidSegment =
   | { kind: 'markdown'; text: string }
   | { kind: 'mermaid'; code: string; raw: string }
+  | { kind: 'details'; summary: string; segments: Array<{ kind: 'markdown'; text: string } | { kind: 'mermaid'; code: string; raw: string }> }
 
 /**
  * 受支持的 Mermaid 图类型。与 Mermaid 的图类型指令一致，未知类型不进入渲染。
@@ -70,15 +71,8 @@ export function mermaidFenceStats(content: string): { blocks: number; valid: num
   return { blocks: fences.length, valid: fences.filter(fence => hasMermaidDiagramType(fence.code)).length }
 }
 
-/**
- * 按有效 Mermaid 图切分 Markdown，供页面逐图渲染。
- * 类型无效的围栏留在 Markdown 片段中，继续按原始代码块展示，不尝试渲染。
- * 没有有效图时返回单个 Markdown 片段。
- * @param content Markdown 原文。
- * @returns Markdown 与图表片段，顺序与原文一致。
- */
-export function splitMermaidDiagrams(content: string): MermaidSegment[] {
-  const segments: MermaidSegment[] = []
+function splitFlatMermaidDiagrams(content: string): Array<{ kind: 'markdown'; text: string } | { kind: 'mermaid'; code: string; raw: string }> {
+  const segments: Array<{ kind: 'markdown'; text: string } | { kind: 'mermaid'; code: string; raw: string }> = []
   let cursor = 0
   for (const fence of findMermaidFences(content)) {
     if (!hasMermaidDiagramType(fence.code)) continue
@@ -87,5 +81,29 @@ export function splitMermaidDiagrams(content: string): MermaidSegment[] {
     cursor = fence.end
   }
   if (cursor < content.length) segments.push({ kind: 'markdown', text: content.slice(cursor) })
+  return segments.length ? segments : [{ kind: 'markdown', text: content }]
+}
+
+/**
+ * 按有效 Mermaid 图切分 Markdown，供页面逐图渲染。
+ * 类型无效的围栏留在 Markdown 片段中，继续按原始代码块展示，不尝试渲染。
+ * 包含有效 Mermaid 图的 `<details>` 折叠块会保持整体结构，避免被切碎。
+ * 没有有效图时返回单个 Markdown 片段。
+ * @param content Markdown 原文。
+ * @returns Markdown、图表与折叠片段，顺序与原文一致。
+ */
+export function splitMermaidDiagrams(content: string): MermaidSegment[] {
+  const detailsPattern = /^<details>\r?\n<summary>([^\n<]+)<\/summary>\r?\n([\s\S]*?)^<\/details>/gm
+  const blocks = [...content.matchAll(detailsPattern)].filter(match => mermaidFenceStats(match[2] ?? '').valid > 0)
+  if (!blocks.length) return splitFlatMermaidDiagrams(content)
+  const segments: MermaidSegment[] = []
+  let cursor = 0
+  for (const match of blocks) {
+    const start = match.index ?? 0
+    if (start > cursor) segments.push(...splitFlatMermaidDiagrams(content.slice(cursor, start)))
+    segments.push({ kind: 'details', summary: (match[1] ?? '').trim(), segments: splitFlatMermaidDiagrams((match[2] ?? '').trim()) })
+    cursor = start + match[0].length
+  }
+  if (cursor < content.length) segments.push(...splitFlatMermaidDiagrams(content.slice(cursor)))
   return segments.length ? segments : [{ kind: 'markdown', text: content }]
 }

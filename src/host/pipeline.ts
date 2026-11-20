@@ -68,7 +68,7 @@ export class WikiPipeline {
     this.getDefaultModel = options.getDefaultModel; this.validateModel = options.validateModel
     this.projectSettings = new ProjectSettingsStore(this.stateDir, { language: this.config.language as 'zh' | 'en', model: null,
       maxPages: this.config.maxPages, autoUpdate: false, autoExport: false, agentReference: true,
-      collaboration: 'collaborative', concurrency: 2, roles: {} })
+      collaboration: 'collaborative', concurrency: 2, granularity: 'standard', roles: {} })
     this.checkpoints = new CheckpointStore(this.stateDir)
     this.ready = this.restore()
     if (options.autoPollMs !== 0) {
@@ -216,9 +216,10 @@ export class WikiPipeline {
     const jobId = randomUUID()
     // Persist new-project defaults before publishing makes this look like a legacy Wiki.
     await this.projectSettings.update(path, current => current)
+    const effectiveMode = options.mode ?? 'generate'
     const job: Job = { schemaVersion: this.newEngine === 'agent-v1' ? 2 : 1, engine: this.newEngine === 'agent-v1' ? 'agent-v1' : undefined, pages: [], cards: [], verified: [], status: { ...idle(), engine: this.newEngine, collaboration: record.settings.collaboration ?? 'collaborative', running: true, jobId, wikiId, repoPath: path, stage: 'queued', model: selection,
       currentPage: null, startedAt: new Date().toISOString(), finishedAt: null, trigger: options.trigger ?? 'manual', warning: null },
-      selection, settings: { ...structuredClone(record.settings), exclude: scanExclude }, controller: new AbortController(), mode: options.mode ?? 'generate',
+      selection, settings: { ...structuredClone(record.settings), exclude: scanExclude }, controller: new AbortController(), mode: effectiveMode,
       qualityPolicy: this.qualityPolicy, readingPlanRequired: true, commit: options.commit, sessionId: options.sessionId ?? options.agent?.id }
     await this.save(job)
     this.jobs.set(jobId, job); this.queue.push(job)

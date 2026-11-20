@@ -91,7 +91,7 @@ export function suspiciousCitations(content: string, paths: Iterable<string>): s
   return [...found].slice(0, 8)
 }
 
-function mergeSpans(sources: SourceExcerpt[]): Array<{ startLine: number; endLine: number }> {
+export function mergeSpans(sources: ReadonlyArray<Pick<SourceExcerpt, 'startLine' | 'endLine'>>): Array<{ startLine: number; endLine: number }> {
   const out: Array<{ startLine: number; endLine: number }> = []
   for (const source of [...sources].sort((a, b) => a.startLine - b.startLine)) {
     const last = out.at(-1)

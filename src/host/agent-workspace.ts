@@ -6,7 +6,8 @@ import type { Checkpoint } from './checkpoints.js'
 import type { RepositorySnapshot } from './snapshot.js'
 import { readManifest, readPageContent, readSourceContent, writeWiki, type WritePageInput } from './store.js'
 import { WikiError } from './errors.js'
-import { parseCitations, suspiciousCitations } from './citations.js'
+import { mergeSpans, parseCitations, suspiciousCitations } from './citations.js'
+import { parseJsonArray } from './page-tools.js'
 import { type WikiOutline } from './prompts.js'
 import { validateReadingPlan } from '../shared/reading.js'
 import { augmentPages } from './ast-flow.js'
@@ -22,16 +23,6 @@ export class PageQualityError extends WikiError {
     this.name = 'PageQualityError'
   }
 }
-type Span = Pick<SourceExcerpt, 'startLine' | 'endLine'>
-function mergeSpans(spans: Span[]): Span[] {
-  const out: Span[] = []
-  for (const span of [...spans].sort((a, b) => a.startLine - b.startLine)) {
-    const last = out.at(-1)
-    if (last && span.startLine <= last.endLine + 1) last.endLine = Math.max(last.endLine, span.endLine)
-    else out.push({ ...span })
-  }
-  return out
-}
 const id = z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/)
 const rawId = z.string().trim().min(1).max(64)
 const short = z.string().trim().min(1).max(500)
@@ -40,30 +31,15 @@ const claim = z.object({ claim: short, evidence: z.array(evidence).min(1) })
 const claimList = z.array(claim).min(1)
 const reviewInput = z.object({
   pass: z.boolean(),
+  plainLanguage: z.boolean().nullable().optional(),
   relevance: z.boolean().nullable(),
   structure: z.boolean().nullable(),
   citations: z.boolean(),
   issues: z.array(short).max(8),
 })
-/** Some models serialize claims and leave quotes inside quote values unescaped. */
-function parseClaimsString(value: string): unknown {
-  try { return JSON.parse(value) } catch { /* Repair below. */ }
-  let repaired = '', inString = false
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i]!
-    if (inString && ch === '\\') { repaired += ch + (value[++i] ?? ''); continue }
-    if (ch !== '"') { repaired += ch; continue }
-    if (!inString) { inString = true; repaired += ch; continue }
-    let next = i + 1
-    while (next < value.length && /\s/.test(value[next]!)) next++
-    if (next === value.length || [':', ',', '}', ']'].includes(value[next]!)) { inString = false; repaired += ch }
-    else repaired += '\\"'
-  }
-  try { return JSON.parse(repaired) } catch { throw new Error('claims 必须是数组，或可解析为数组的 JSON 字符串。') }
-}
 /** Accept both the native array and a JSON-string wrapper produced by some tool-calling models. */
-const claimsInput = z.union([claimList, z.string().min(1).transform(value => claimList.parse(parseClaimsString(value)))])
-const pageType = z.enum(['overview', 'architecture', 'module', 'api', 'data', 'workflow', 'config', 'testing', 'ops'])
+const claimsInput = z.union([claimList, z.string().min(1).transform(value => claimList.parse(parseJsonArray(value)))])
+const pageType = z.enum(['overview', 'quickstart', 'guide', 'developer', 'architecture', 'module', 'api', 'data', 'workflow', 'config', 'security', 'testing', 'ops', 'troubleshooting', 'extension'])
 const node = z.object({ id: rawId, kind: z.enum(['group', 'page']), type: pageType.optional(), parentId: rawId.nullable(), title: short, summary: short, sections: z.array(short).max(12).optional(), coverage: z.array(short).max(12).optional(), relatedPaths: z.array(short), readerQuestion: short.optional(), scope: short.optional(), relatedPageIds: z.array(rawId).optional() })
 const outline = z.object({ title: short, description: short, pages: z.array(node).min(1), readingPaths: z.object({ user: z.array(rawId), developer: z.array(rawId), maintainer: z.array(rawId) }).optional() })
 function normalizeOutlineId(value: string): string {
@@ -91,8 +67,8 @@ export function recordPlannerFailure(job: Checkpoint, outline: WikiOutline | nul
 export class AgentWorkspace {
   private tail: Promise<unknown> = Promise.resolve()
   private readCount = 0
-  /** pageId -> content digest that already received one soft quality rejection. */
-  private qualityAttempts = new Map<string, string>()
+  /** pageId -> number of soft quality rejections already issued for this page. */
+  private qualityAttempts = new Map<string, number>()
   constructor(readonly job: Checkpoint, readonly snapshot: RepositorySnapshot, readonly stateDir: string,
     readonly signal: AbortSignal, readonly save: () => Promise<void>, readonly assertVersion: () => Promise<void>, readonly maxPageBytes: number) {}
   get state() { return this.job.agentState! }
@@ -189,10 +165,10 @@ export class AgentWorkspace {
     const p = this.page(id)
     if (Buffer.byteLength(content) > this.maxPageBytes) throw new Error('正文超过单篇安全字节范围，请聚焦当前主题；不要截断正文。')
     const sources = this.citationSources(content, given)
-    const quality = evaluatePage(p, content, sources, this.snapshot.files.map(file => file.path))
+    const quality = evaluatePage(p, content, sources, this.snapshot.files.map(file => file.path), { userRoute: this.job.outline?.readingPaths?.user.includes(id) ?? false })
     return {
       page: {
-        readerQuestion: p.readerQuestion, scope: p.scope, relatedPageIds: p.relatedPageIds, kind: p.kind, type: p.type,
+        readerQuestion: p.readerQuestion, scope: p.scope, relatedPageIds: p.relatedPageIds, kind: p.kind, ...(p.isHub ? { isHub: true } : {}), type: p.type,
         id: p.id, title: p.title, summary: p.summary, parentId: p.parentId, content, sources,
         quality: compactQuality(quality), related: [...new Set(sources.map(s => s.path))],
       },
@@ -222,16 +198,16 @@ export class AgentWorkspace {
     return { id: p.id, readable: true, quality, ...(warnings.length || quality.soft.length ? { warnings: [...warnings, ...quality.soft] } : {}) }
   }
 
-  /** Single-Agent save tool: allow one soft-quality revision, keyed by the content being saved. */
+  /** Single-Agent save tool: allow one soft-quality revision per page, aligning with collaborative mode. */
   private savePageWithQuality(id: string, content: string, given: SourceExcerpt[]) {
-    const key = digest(content)
-    const allowSoft = this.qualityAttempts.get(id) === key
+    const attempts = this.qualityAttempts.get(id) ?? 0
+    const allowSoft = attempts >= 1
     try {
       const result = this.commitPage(id, content, given, { allowSoft })
       this.qualityAttempts.delete(id)
       return result
     } catch (error) {
-      if (error instanceof PageQualityError && error.level === 'soft') this.qualityAttempts.set(id, key)
+      if (error instanceof PageQualityError && error.level === 'soft') this.qualityAttempts.set(id, attempts + 1)
       throw error
     }
   }
@@ -254,15 +230,15 @@ export class AgentWorkspace {
     supported: boolean
     issues: string[]
     claims: { claim: string; evidence: Array<Omit<CardEvidence, 'quote'> & { quote?: string }> }[]
-    review?: { pass: boolean; relevance: boolean | null; structure: boolean | null; citations: boolean; issues: string[] }
-  }, given: SourceExcerpt[] = []) {
+    review?: { pass: boolean; plainLanguage?: boolean | null; relevance: boolean | null; structure: boolean | null; citations: boolean; issues: string[] }
+  }, given: SourceExcerpt[] = [], options: { revised?: boolean } = {}) {
     const target = input.kind === 'page' ? this.job.pages.find(p => p.id === input.id) : this.job.cards.find(c => c.id === input.id)
     if (!target) throw new Error('待核验成果不存在。')
     for (const source of given) if (!this.state.evidence.some(known => known.id === source.id)) this.state.evidence.push(source)
     const claims = input.claims.map(claim => ({ ...claim, evidence: this.checkEvidence(claim.evidence) }))
     if (!input.supported && !input.issues.length || input.supported && input.issues.length) throw new Error('核验结论与问题清单不一致。')
     if (this.job.qualityPolicy === 'enforce' && input.kind === 'page' && !input.review) throw new Error('核验必须提交可读性审阅 review。')
-    const review: PageReviewMeta | undefined = input.review ? { ...input.review, mode: 'model', checkedAt: new Date().toISOString() } : undefined
+    const review: PageReviewMeta | undefined = input.review ? { ...input.review, mode: 'model', ...(options.revised ? { revised: true } : {}), checkedAt: new Date().toISOString() } : undefined
     const key = `${input.kind}:${input.id}`
     this.job.status.stage = 'verify'; this.job.status.currentAction = `核验 ${target.title}`
     if (input.kind === 'page') {
@@ -329,6 +305,40 @@ export class AgentWorkspace {
     return { id, verification: 'supported' as const, mode: 'host-rule' as const }
   }
 
+  /**
+   * 提交轻量可读性审阅结果：在规则核验完成机械事实校验后，独立记录语义可读性与人话表达结论。
+   */
+  commitReview(id: string, input: {
+    pass: boolean
+    plainLanguage?: boolean | null
+    relevance: boolean | null
+    structure: boolean | null
+    citations: boolean
+    issues: string[]
+  }, options: { revised?: boolean } = {}): PageReviewMeta {
+    const page = this.job.pages.find(entry => entry.id === id)
+    if (!page) throw new Error('待审阅页面不存在。')
+    const key = `page:${id}`
+    const review: PageReviewMeta = {
+      pass: input.pass,
+      ...(input.plainLanguage !== undefined ? { plainLanguage: input.plainLanguage } : {}),
+      relevance: input.relevance,
+      structure: input.structure,
+      citations: input.citations,
+      issues: input.issues.slice(0, 8),
+      mode: 'model',
+      ...(options.revised ? { revised: true } : {}),
+      checkedAt: new Date().toISOString(),
+    }
+    page.review = review
+    const record = this.state.verifications[key]
+    if (record && record.digest === digest(page.content)) record.review = review
+    const item = this.item(id)
+    if (item) item.reviewState = review.pass || review.revised ? 'pass' : 'revise'
+    this.changed()
+    return review
+  }
+
   async publish(cardSummary: string) {
     if (!this.job.outline) throw new Error('尚未提交目录。')
     await this.assertVersion()
@@ -343,26 +353,37 @@ export class AgentWorkspace {
     const missing = this.job.outline.pages.filter(p => p.kind !== 'group').filter(p => !this.job.pages.some(w => w.id === p.id))
     const unchecked = [...this.job.pages.map(p => ({ key: `page:${p.id}`, content: p.content })), ...this.job.cards.map(c => ({ key: `card:${c.id}`, content: c.content }))].filter(t => this.state.verifications[t.key]?.digest !== digest(t.content))
     if (missing.length || unchecked.length) throw new Error(`仍有未完成页面或核验：${[...missing.map(p => p.id), ...unchecked.map(t => t.key)].join(', ')}`)
+    const reviewWarnings: string[] = []
     if (this.job.qualityPolicy === 'enforce') {
-      const reviewPending = this.job.pages.filter(page => page.review?.mode === 'model' && page.review.pass === false)
+      const reviewPending = this.job.pages.filter(page => page.review?.mode === 'model' && page.review.pass === false && !page.review.revised)
       if (reviewPending.length) throw new Error(`仍有可读性审阅未通过：${reviewPending.map(page => page.id).join(', ')}`)
+      for (const page of this.job.pages) {
+        if (page.review?.mode === 'model' && page.review.pass === false && page.review.revised) {
+          reviewWarnings.push(`页面 ${page.title} 修订后仍有可读性建议：${page.review.issues.slice(0, 2).join('；')}`)
+        }
+      }
       // Old checkpoints may predate the quality field; evaluate before publishing so every new revision has the same gate.
       const qualityPages = this.job.pages.map(page => {
         if (!page.quality) {
           const outlinePage = this.job.outline!.pages.find(p => p.id === page.id)!
-          const quality = evaluatePage(outlinePage, page.content, page.sources ?? [], this.snapshot.files.map(file => file.path))
+          const quality = evaluatePage(outlinePage, page.content, page.sources ?? [], this.snapshot.files.map(file => file.path), { userRoute: this.job.outline?.readingPaths?.user.includes(page.id) ?? false })
           if (quality.hard.length) throw new PageQualityError(`页面质量硬性失败：${page.id}：${quality.hard.join('；')}`, quality, 'hard')
           page.quality = compactQuality(quality)
         }
         return { content: page.content, sources: page.sources ?? [], quality: page.quality }
       })
-      this.job.status.quality = aggregateQuality(qualityPages, Object.keys(this.state.verifications).filter(key => key.startsWith('page:')).length, [])
+      this.job.status.quality = aggregateQuality(qualityPages, Object.keys(this.state.verifications).filter(key => key.startsWith('page:')).length, reviewWarnings)
     }
     const now = new Date().toISOString(), previous = await readManifest(this.stateDir, this.job.status.wikiId!)
     const pages: WritePageInput[] = this.job.outline.pages.map(n => n.kind === 'group' ? { ...n, kind: 'group', content: '', related: [] } : { ...this.job.pages.find(p => p.id === n.id)!, readerQuestion: n.readerQuestion, scope: n.scope, relatedPageIds: n.relatedPageIds })
     // 确定性结构图在发布时注入：核验阶段只面对模型正文，发布版额外带上 Host 解析出的结构。
+    const skipStructureIds = new Set([
+      ...(this.job.outline.readingPaths?.user ?? []),
+      ...this.job.outline.pages.filter(n => n.isHub).map(n => n.id),
+    ])
     await augmentPages(pages.filter(page => page.kind !== 'group'), this.snapshot.files, this.job.settings.language,
-      id => this.job.outline?.pages.find(n => n.id === id)?.type)
+      id => this.job.outline?.pages.find(n => n.id === id)?.type,
+      { skipIds: skipStructureIds })
     this.job.status.stage = 'write'
     const saved = await writeWiki(this.stateDir, { id: this.job.status.wikiId!, repoPath: this.snapshot.root, title: this.job.outline.title, description: this.job.outline.description, readingPaths: this.job.outline.readingPaths, language: this.job.settings.language,
       createdAt: previous?.createdAt ?? now, updatedAt: now, generator: 'dsh-repowiki/agent-v1', jobId: this.job.status.jobId, source: this.snapshot.source, sourceIndex: this.snapshot.files.map(f => ({ path: f.path, hash: f.hash })), model: this.job.selection, cards: this.job.cards }, pages, this.signal)
@@ -486,17 +507,31 @@ export class AgentWorkspace {
         if (byId.size !== nodes.length || !nodes.some(n => n.kind === 'page')) this.plannerReject(a.outline, new Error('目录须有正文页面，且标识唯一。'))
         for (const n of nodes) {
           const seen = new Set([n.id]); let parent = n.parentId
-          while (parent) { if (seen.has(parent) || !byId.has(parent)) throw new Error(`目录存在循环或不存在的父节点：${n.id} → ${parent}（请检查该页的 parentId）`); seen.add(parent); parent = byId.get(parent)!.parentId }
+          while (parent) {
+            if (seen.has(parent) || !byId.has(parent)) throw new Error(`目录存在循环或不存在的父节点：${n.id} → ${parent}（请检查该页的 parentId）`)
+            seen.add(parent)
+            if (seen.size > 3) this.plannerReject(a.outline, new Error(`目录层级超过三级：${n.id}（最多三层：顶层大类 → 子系统 → 细分页）`))
+            parent = byId.get(parent)!.parentId
+          }
           if (n.relatedPaths.some(p => !this.snapshot.files.some(f => f.path === p))) this.plannerReject(a.outline, new Error('目录来源路径不在快照中。'))
           if (n.kind === 'page' && (!n.relatedPaths.length || !n.relatedPaths.some(p => this.state.evidence.some(s => s.path === p)))) this.plannerReject(a.outline, new Error('每个页面必须对应实际源码，并至少先读取一处规划依据。'))
           if (n.kind === 'page') {
             if (!n.type) hints.push(`页面 ${n.id} 缺少 type，补齐后才能按页面类型校验深度`)
-            if (!n.sections?.length) hints.push(`页面 ${n.id} 缺少 sections，建议列出 3-8 个实际章节`)
+            if (!n.sections?.length) hints.push(`页面 ${n.id} 缺少 sections，建议列出 2-6 个实际章节`)
             if (!n.coverage?.length) hints.push(`页面 ${n.id} 缺少 coverage，建议标注覆盖矩阵类别`)
             if (n.type === 'module' && n.relatedPaths.length > 6) hints.push(`模块页 ${n.id} 关联 ${n.relatedPaths.length} 个文件，建议拆分为多个模块页`)
           }
         }
-        const normalized = { ...a.outline, pages: nodes, readingPaths: a.outline.readingPaths ? { user: a.outline.readingPaths.user.map(normalizeOutlineId), developer: a.outline.readingPaths.developer.map(normalizeOutlineId), maintainer: a.outline.readingPaths.maintainer.map(normalizeOutlineId) } : undefined }
+        const hasChildren = new Set(nodes.map(n => n.parentId).filter((parent): parent is string => !!parent))
+        const enrichedNodes = nodes.map(n => (n.kind === 'page' && hasChildren.has(n.id) ? { ...n, isHub: true } : n))
+        const contentPages = enrichedNodes.filter(n => n.kind === 'page')
+        const topLevel = enrichedNodes.filter(n => n.parentId === null)
+        if (contentPages.length >= 10 && topLevel.length < 4) hints.push(`顶层大类仅 ${topLevel.length} 个，建议按「概览 / 快速上手 / 使用指南 / 开发者指南 / 系统架构 / API 参考 / 测试运维」细化分类`)
+        for (const parent of enrichedNodes) {
+          const direct = contentPages.filter(n => n.parentId === parent.id)
+          if (direct.length > 6) hints.push(`分类 ${parent.title} 下平铺了 ${direct.length} 个子页，建议按子系统再分一层`)
+        }
+        const normalized = { ...a.outline, pages: enrichedNodes, readingPaths: a.outline.readingPaths ? { user: a.outline.readingPaths.user.map(normalizeOutlineId), developer: a.outline.readingPaths.developer.map(normalizeOutlineId), maintainer: a.outline.readingPaths.maintainer.map(normalizeOutlineId) } : undefined }
         validateReadingPlan(normalized)
         if (this.job.outline && digest(normalized) === digest(this.job.outline)) return { version: this.job.status.outlineVersion, unchanged: true, ...(hints.length ? { hints: hints.slice(0, 12) } : {}) }
         if (this.job.outline) {

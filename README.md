@@ -1,9 +1,11 @@
 # DSH 仓库维基（dsh-repowiki）
 
-0.7.8 · DSH 0.2.1-rc.4 / 0.2.1-rc.5 / 0.2.2-rc.1 · Node ≥ 22.19
+0.7.21 · DSH 0.2.1-rc.4 / 0.2.1-rc.5 / 0.2.2-rc.1 / 0.2.2-rc.3+ · Node ≥ 22.19
 
 将本地代码仓库生成为带源码依据的多页 Wiki 和知识卡片。项目总览保留筛选、卡片和列表视图；项目详情采用左侧搜索与可折叠目录、右侧配置 / 进度 / 正文，跟随 DSH 中英文界面和主题。
 
+> 0.7.21：扩展支持 DSH `>=0.2.2-rc.3 <0.2.3-0`；任务进度升级为 `StatusMark` + `ThoughtLine` 轨迹视图，目录树使用 `BranchedMenu`，生成设置的语言、目录粒度、并发子代理与思考强度改为 `GooeyNav` 流体选择器（支持 `disabled` 禁用态、`div[role="group"]` 语义、无 WebGL 静态回退与宿主深浅主题跟随）；本地数据清理体积格式化为 B / KiB / MiB / GiB。详见 `docs/verification.md`。
+>
 > 0.7.8：适配 DSH 0.2.2-rc.1 宿主。0.2.2 删除了 `ToolsService.presentAs`（呈现方式改由组合挂载的 native / PTC executor 决定），Wiki 子代理的“只允许自己的工具、按原生方式呈现”统一收敛到 `src/host/tool-scope.ts`，运行时检测旧宿主是否仍有 `presentAs` 再决定调用；生成规则、界面与数据格式未变。依据与验证见 `docs/verification.md`。
 >
 > 0.7.7：一套 Wiki 支持“使用项目 / 接手开发 / 深入维护”三条阅读路线，共享正文；切换路线不调用模型。新规划按独立主题组织，不再按文件数凑页、按来源数凑图或按引用数补写。旧 Wiki 保留原目录，重新生成后才有路线。图表支持放大、原始尺寸和缩放；引用直接定位到来源代码，目录导航回到正文，阅读目录可收起；任务栏将正文生成与核验状态分开显示。
@@ -101,10 +103,10 @@ Agent 比较上一版本与变化文件，自主规划完整目录。只有全�
 
 ```powershell
 $dshCli = '<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd'
-& $dshCli plugin --profile desktop add '<发布包路径>\dsh-repowiki-0.5.0.tgz' --ignore-scripts
+& $dshCli plugin --profile desktop add '<发布包路径>\dsh-repowiki-0.7.21.tgz' --ignore-scripts
 ```
 
-插件依赖 `ignore` 7.0.14（MIT）与 `typescript` ^5.8.0（Apache-2.0，按需动态加载用于 AST 解析），由安装器解析。Host / Client 沿用 DSH SDK 与原生组件，没有额外模型进程或前台页面保活要求。Mermaid 12.2.0（MIT）作为构建期 devDependency，被单独打包进 `lib/client.mermaid.js`（5,298,398 字节，约 5.05 MiB；gzip 约 1.44 MiB），只在首次遇到有效图表时由 DSH 模块加载器按需下载；面板初始 `lib/client.js` 保持 336,171 字节（gzip 约 41 KiB）。图表使用 `securityLevel: 'strict'` 和纯 SVG 文本标签，不执行图表内 HTML。
+插件依赖 `ignore` 7.0.14（MIT）与 `typescript` ^5.8.0（Apache-2.0，按需动态加载用于 AST 解析），由安装器解析。Host / Client 沿用 DSH SDK 与原生组件，没有额外模型进程或前台页面保活要求。Mermaid 12.2.0（MIT）作为构建期 devDependency，被单独打包进 `lib/client.mermaid.js`（5,304,982 字节，约 5.06 MiB；gzip 约 1.45 MiB），只在首次遇到有效图表时由 DSH 模块加载器按需下载；面板初始 `lib/client.js` 为 511,415 字节（gzip 约 72.5 KiB）。图表使用 `securityLevel: 'strict'` 和纯 SVG 文本标签，不执行图表内 HTML。
 
 ## 会话工具与 RPC
 
@@ -137,7 +139,6 @@ npm run test:host-compatibility
 ```
 
 `scripts/acceptance-host.mjs` 支持独立 Host 加载探针和隔离页面验收，使用显式 runtime / home / profile，不修改日用配置。具体证据见 [验收记录](docs/verification.md)，产品与开源依据见 [参考来源](docs/references.md)。
-
 
 ## Public source checkout
 
